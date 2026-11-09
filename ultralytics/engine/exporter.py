@@ -133,7 +133,6 @@ from ultralytics.utils.checks import (
     check_data_portable,
     check_imgsz,
     check_python,
-    check_rdk_requirements,
     check_requirements,
     check_version,
     is_intel,
@@ -242,7 +241,7 @@ def export_formats():
             ["batch", "name", "quantize", "opset", "simplify", "data", "fraction"],
             "isolated-rknn",
         ],
-        ["RDK", "rdk", "_rdk_model", False, False, ["data"], "isolated-rdk"],
+        ["RDK", "rdk", "_rdk_model", False, False, ["data", "fraction"], "isolated-rdk"],
         ["ExecuTorch", "executorch", "_executorch_model", True, False, ["batch"], "executorch"],
         [
             "Axelera AI",
@@ -1208,7 +1207,14 @@ class Exporter:
             assert TORCH_1_13, f"'nms=True' ONNX export requires torch>=1.13 (found torch=={TORCH_VERSION})"
 
         f = str(self.file.with_suffix(".onnx"))
-        output_names = ["output0", "output1"] if self.model.task == "segment" else ["output0"]
+        output_names = (
+            # RDK raw heads emit every per-level tensor; name each one from its recorded contract
+            [o["name"] for o in self.metadata["rdk"]["outputs"]]
+            if self.args.format == "rdk"
+            else ["output0", "output1"]
+            if self.model.task == "segment"
+            else ["output0"]
+        )
         dynamic = self.args.dynamic
         if dynamic:
             dynamic = {"images": {0: "batch", 2: "height", 3: "width"}}  # shape(1,3,640,640)
@@ -1669,19 +1675,35 @@ class Exporter:
     @try_export
     def export_rdk(self, prefix=colorstr("D-Robotics:")):  # noqa: B008
         """Export YOLO model to a D-Robotics RDK X5 BPU *.bin model via the hb_mapper toolchain."""
-        from ultralytics.utils.export.rdk import apply_rdk_patches, export_rdk
+        from ultralytics.utils.export.rdk import apply_rdk_patches, onnx2rdk
 
-        check_rdk_requirements()
-        # Apply the BPU-specific raw-head patches to the exporter's model copy
-        apply_rdk_patches(self.model)
-        # Export the intermediate ONNX with the built-in method; opset 11 is well supported by BPU hb_mapper
-        old_opset = self.args.opset
+        # dynamic/batch>1 are rejected by validate_args (only 'data'/'fraction' are valid rdk args); channels is not
+        # an export arg, so it is checked here
+        assert self.im.shape[1] == 3, "D-Robotics RDK export only supports 3-channel models."
+        # Bind the raw heads on the exporter's model copy and record their schema-1 contract
+        self.metadata["rdk"] = apply_rdk_patches(self.model)
+        y = self.model(self.im)  # dry run the raw heads for the actual output shapes
+        outputs = y if isinstance(y, (list, tuple)) else [y]
+        assert len(outputs) == len(self.metadata["rdk"]["outputs"]), (
+            f"D-Robotics RDK raw head produced {len(outputs)} outputs but the contract lists "
+            f"{len(self.metadata['rdk']['outputs'])}."
+        )
+        for output, shape in zip(self.metadata["rdk"]["outputs"], outputs):
+            output["shape"] = list(shape.shape)
+        # The X5 hb_mapper ONNX parser is validated on opset 11
+        opset = self.args.opset
         self.args.opset = 11
-        onnx_file = self.export_onnx()
-        self.args.opset = old_opset  # restore original opset
-        # Save metadata next to the ONNX; export_rdk() moves it into the final model directory
-        YAML.save(Path(onnx_file).parent / "metadata.yaml", self.metadata)
-        return export_rdk(self.model, self.args, onnx_path=onnx_file)
+        try:
+            f_onnx = self.export_onnx()
+        finally:
+            self.args.opset = opset  # restore the original opset
+        return onnx2rdk(
+            onnx_file=f_onnx,
+            output_dir=self.file.parent / f"{self.file.stem}_rdk_model",
+            dataset=self.get_int8_calibration_dataloader(prefix),
+            metadata=self.metadata,
+            prefix=prefix,
+        )
 
     @try_export
     def export_ascend(self, prefix=colorstr("Ascend:")):  # noqa: B008

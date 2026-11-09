@@ -1,243 +1,375 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
-"""D-Robotics RDK X5 BPU export logic."""
+"""D-Robotics RDK X5 BPU export logic.
 
-import os
+Raw-head contract (consumed by the RDK backend, ``ultralytics/nn/backends/rdk.py``): every head exports its active
+(one2one or one2many) branch as one NHWC tensor per scale, named ``<role>_<stride>`` (plus ``proto`` for Segment and
+``logits`` for Classify), recorded in ``metadata['rdk']['outputs']`` and bound by name at runtime.
+
+Roles and their numerical meaning:
+
+- ``cls``: raw class logits per anchor; sigmoid gives per-class object scores.
+- ``box``: ``reg_max > 1`` (YOLO11/v8): ``4 * reg_max`` DFL bin logits, host applies softmax over each side's bins,
+  expectation, then ``(grid + 0.5 ± ltrb) * stride``; ``reg_max == 1`` (YOLO26/v10): direct LTRB distances in stride
+  units with the same anchor equation.
+- ``mask``: raw mask coefficients (``nm``) per anchor; no activation, combined with prototypes host-side.
+- ``proto``: prototype map shaped ``(1, H/4, W/4, nm)`` (P3 feature upsampled 2x); no activation.
+- ``kpt``: raw keypoints (``nk`` channels). Pose (YOLO11): ``(raw_xy * 2 + grid + 0.5) * stride`` and
+  ``sigmoid(raw_v)``; Pose26: ``(raw_xy + grid + 0.5) * stride`` (no 2x scale) and ``sigmoid(raw_v)``.
+- ``angle``: OBB11: ``(sigmoid(raw) - 0.25) * pi`` in ``[-pi/4, 3pi/4]``; OBB26: raw angle in radians. Boxes decode
+  with ``dist2rbox(ltrb, angle, grid + 0.5)``.
+- ``logits``: classifier logits; softmax is applied exactly once on the host.
+"""
+
+from __future__ import annotations
+
+import json
 import shutil
 import subprocess
-import numpy as np
-import torch
-import cv2
+import tempfile
 from pathlib import Path
 
-from ultralytics.utils import LOGGER, colorstr, LINUX, ARM64
+import numpy as np
+import torch
 
-def bpu_detect_forward(self, x):
-    """YOLO Detect Head Modified for D-Robotics BPU."""
+from ultralytics.utils import ARM64, LINUX, LOGGER, YAML, colorstr
+
+TOOLCHAIN_DOC = "https://developer.d-robotics.cc/rdk_x5"
+_COMPILE_TIMEOUT = 3600  # seconds; a 640px O3 INT8 compile of a nano model takes minutes
+_DESCRIBE_TIMEOUT = 600  # seconds for one rdkx5-sim --describe call
+
+
+def _rdk_branch(head):
+    """Return the fused head's active component dict, failing clearly when the branch is incomplete.
+
+    Args:
+        head (Detect): Fused YOLO detect-family head (the exporter already selected and fused one branch).
+
+    Returns:
+        (dict): The head's ``one2one`` or ``one2many`` component dict with every inference component non-None.
+
+    Raises:
+        ValueError: If the selected branch is missing inference components (e.g. fusion removed both heads).
+    """
+    branch = head.one2one if head.end2end else head.one2many
+    required = [k for k in branch if k != "kpts_sigma_head"]  # sigma is a training-only output
+    missing = [k for k in required if branch[k] is None]
+    if missing:
+        raise ValueError(
+            f"D-Robotics RDK export needs a complete '{'one2one' if head.end2end else 'one2many'}' head, but "
+            f"{type(head).__name__} is missing {missing}. Re-export from the original (unfused) checkpoint."
+        )
+    return branch
+
+
+def _rdk_detect_forward(self, x):
+    """Detect-family raw BPU forward: cls + box NHWC tensors per scale from the active branch."""
+    branch = _rdk_branch(self)
     res = []
-    # Support YOLO26/v10 one2one weights
-    cv3 = self.one2one_cv3 if hasattr(self, "one2one_cv3") else self.cv3
-    cv2 = self.one2one_cv2 if hasattr(self, "one2one_cv2") else self.cv2
     for i in range(self.nl):
-        res.append(cv3[i](x[i]).permute(0, 2, 3, 1).contiguous())  # cls
-        res.append(cv2[i](x[i]).permute(0, 2, 3, 1).contiguous())  # bbox
+        res.append(branch["cls_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # cls
+        res.append(branch["box_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # box
     return res
 
-def bpu_v10_detect_forward(self, x):
-    """YOLOv10 Detect Head Modified for D-Robotics BPU."""
+
+def _rdk_segment_forward(self, x):
+    """YOLO11 Segment raw BPU forward: cls + box + mask NHWC per scale, then the P3 prototype map."""
+    branch = _rdk_branch(self)
     res = []
     for i in range(self.nl):
-        res.append(self.one2one_cv3[i](x[i]).permute(0, 2, 3, 1).contiguous())  # cls
-        res.append(self.one2one_cv2[i](x[i]).permute(0, 2, 3, 1).contiguous())  # bbox
+        res.append(branch["cls_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # cls
+        res.append(branch["box_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # box
+        res.append(branch["mask_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # mask coefficients
+    res.append(self.proto(x[0]).permute(0, 2, 3, 1).contiguous())  # protos, H/4 x W/4
     return res
 
-def bpu_segment_forward(self, x):
-    """YOLO Segment Head Modified for D-Robotics BPU."""
+
+def _rdk_segment26_forward(self, x):
+    """YOLO26 Segment raw BPU forward; Proto26 consumes the whole feature list, unlike Proto."""
+    branch = _rdk_branch(self)
     res = []
-    # Support YOLO26/v10 one2one weights
-    cv2 = self.one2one_cv2 if hasattr(self, "one2one_cv2") else self.cv2
-    cv3 = self.one2one_cv3 if hasattr(self, "one2one_cv3") else self.cv3
-    cv4 = self.one2one_cv4 if hasattr(self, "one2one_cv4") else self.cv4
     for i in range(self.nl):
-        res.append(cv3[i](x[i]).permute(0, 2, 3, 1).contiguous())  # cls
-        res.append(cv2[i](x[i]).permute(0, 2, 3, 1).contiguous())  # bbox
-        res.append(cv4[i](x[i]).permute(0, 2, 3, 1).contiguous())  # proto weights
-    res.append(self.proto(x[0]).permute(0, 2, 3, 1).contiguous())       # proto mask
+        res.append(branch["cls_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # cls
+        res.append(branch["box_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # box
+        res.append(branch["mask_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # mask coefficients
+    res.append(self.proto(x).permute(0, 2, 3, 1).contiguous())  # protos from the fused multi-scale features
     return res
 
-def bpu_pose_forward(self, x):
-    """YOLO Pose Head Modified for D-Robotics BPU."""
+
+def _rdk_pose_forward(self, x):
+    """YOLO11 Pose raw BPU forward: cls + box + kpt (nk channels) NHWC per scale."""
+    branch = _rdk_branch(self)
     res = []
-    # Support YOLO26/v10 one2one weights
-    cv2 = self.one2one_cv2 if hasattr(self, "one2one_cv2") else self.cv2
-    cv3 = self.one2one_cv3 if hasattr(self, "one2one_cv3") else self.cv3
-    cv4 = self.one2one_cv4 if hasattr(self, "one2one_cv4") else self.cv4
     for i in range(self.nl):
-        res.append(cv3[i](x[i]).permute(0, 2, 3, 1).contiguous())  # cls
-        res.append(cv2[i](x[i]).permute(0, 2, 3, 1).contiguous())  # bbox
-        res.append(cv4[i](x[i]).permute(0, 2, 3, 1).contiguous())  # kpts
+        res.append(branch["cls_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # cls
+        res.append(branch["box_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # box
+        res.append(branch["pose_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # keypoints
     return res
 
-def bpu_obb_forward(self, x):
-    """YOLO OBB Head Modified for D-Robotics BPU."""
+
+def _rdk_pose26_forward(self, x):
+    """YOLO26 Pose raw BPU forward; keypoints come from cv4_kpts applied to the cv4 feature maps."""
+    branch = _rdk_branch(self)
     res = []
-    # Support YOLO26/v10 one2one weights
-    cv2 = self.one2one_cv2 if hasattr(self, "one2one_cv2") else self.cv2
-    cv3 = self.one2one_cv3 if hasattr(self, "one2one_cv3") else self.cv3
-    cv4 = self.one2one_cv4 if hasattr(self, "one2one_cv4") else self.cv4
     for i in range(self.nl):
-        res.append(cv3[i](x[i]).permute(0, 2, 3, 1).contiguous())  # cls
-        res.append(cv2[i](x[i]).permute(0, 2, 3, 1).contiguous())  # bbox
-        res.append(cv4[i](x[i]).permute(0, 2, 3, 1).contiguous())  # theta logits
+        feature = branch["pose_head"][i](x[i])  # cv4 feature extractor
+        res.append(branch["cls_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # cls
+        res.append(branch["box_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # box
+        res.append(branch["kpts_head"][i](feature).permute(0, 2, 3, 1).contiguous())  # nk keypoint channels
     return res
 
-def bpu_classify_forward(self, x):
-    """YOLO Classify Head Modified for BPU. Replaces Linear with Conv2d 1x1."""
-    if x.ndim == 4:
-        x = self.conv(x)
-        x = self.pool(x)
-        x = self.drop(x)
-        if hasattr(self, 'conv_linear'):
-            x = self.conv_linear(x)
-        else:
-            x = torch.flatten(x, 1)
-            x = self.linear(x)
-            return x
-        return x.flatten(1)
-    return self.linear(torch.flatten(self.pool(self.conv(x)), 1))
+
+def _rdk_obb_forward(self, x):
+    """OBB raw BPU forward: cls + box + angle NHWC per scale; the angle activation is decode-side."""
+    branch = _rdk_branch(self)
+    res = []
+    for i in range(self.nl):
+        res.append(branch["cls_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # cls
+        res.append(branch["box_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # box
+        res.append(branch["angle_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # raw angle
+    return res
+
+
+def _rdk_classify_forward(self, x):
+    """Classify raw BPU forward: NHWC logits (1, 1, 1, nc); the host applies softmax exactly once."""
+    if isinstance(x, list):
+        x = torch.cat(x, 1)
+    return self.linear(self.pool(self.conv(x))).permute(0, 2, 3, 1).contiguous()  # linear is a 1x1 Conv2d here
+
 
 def apply_rdk_patches(model):
-    """Applies BPU-specific monkey patches to the model heads."""
+    """Bind raw BPU head forwards on the exporter's model copy and return its `rdk` metadata description.
+
+    Args:
+        model (torch.nn.Module): The exporter's deep copy of a fused YOLO model with one selected branch.
+
+    Returns:
+        (dict): `rdk` schema-1 metadata (task, head_type, strides, reg_max, branch, kpt_shape and the ordered
+            `outputs` role list; the exporter fills each entry's `shape` from its dry run).
+
+    Raises:
+        TypeError | ValueError: If the model's head is not one of the standard YOLO11/YOLO26 detect/segment/pose/
+            obb/classify heads (e.g. YOLOE, YOLOWorld or RT-DETR protocols are not validated for RDK export).
+    """
     from ultralytics.nn.modules import (
         OBB,
-        OBB26,
         Classify,
+        Depth,
         Detect,
+        LRPCHead,
         Pose,
         Pose26,
+        RTDETRDecoder,
         Segment,
         Segment26,
-        YOLOESegment26,
-        v10Detect,
+        SemanticSegment,
+        WorldDetect,
+        YOLOEDetect,
     )
 
-    # Detect if this is an end-to-end (one2one) model
-    is_end2end = False
-    for m in model.modules():
-        if hasattr(m, "one2one_cv2") and hasattr(m, "one2one_cv3"):
-            is_end2end = True
-            break
+    unsupported = (WorldDetect, LRPCHead, YOLOEDetect, RTDETRDecoder, Depth, SemanticSegment)
+    description = None
+    for module in model.modules():
+        if isinstance(module, unsupported):
+            raise TypeError(
+                f"D-Robotics RDK export supports standard YOLO11/YOLO26 detect, segment, classify, pose and obb "
+                f"models, not the {type(module).__name__} protocol."
+            )
+        forward, task = None, None
+        if isinstance(module, Segment26):
+            forward, task = _rdk_segment26_forward, "segment"
+        elif isinstance(module, Segment):
+            forward, task = _rdk_segment_forward, "segment"
+        elif isinstance(module, Pose26):
+            forward, task = _rdk_pose26_forward, "pose"
+        elif isinstance(module, Pose):
+            forward, task = _rdk_pose_forward, "pose"
+        elif isinstance(module, OBB):  # covers OBB26
+            forward, task = _rdk_obb_forward, "obb"
+        elif isinstance(module, Classify):
+            forward, task = _rdk_classify_forward, "classify"
+        elif isinstance(module, Detect):  # covers v10Detect; runs last so task-specific heads match first
+            forward, task = _rdk_detect_forward, "detect"
+        if forward is not None:
+            if task == "classify":  # BPU-friendly 1x1 conv replacing the flatten + Gemm
+                linear = module.linear
+                module.linear = torch.nn.Conv2d(linear.in_features, linear.out_features, 1, bias=True)
+                module.linear.weight.data = linear.weight.data.view(linear.out_features, linear.in_features, 1, 1)
+                module.linear.bias.data = linear.bias.data
+            module.forward = forward.__get__(module, type(module))
+            description = _rdk_metadata(module, task)
+            LOGGER.info(
+                f"{colorstr('D-Robotics:')} raw {type(module).__name__} head bound "
+                f"({description['branch']}, {len(description['outputs'])} outputs)."
+            )
+    if description is None:
+        raise ValueError(
+            "D-Robotics RDK export found no supported YOLO head; expected a standard YOLO11/YOLO26 detect, "
+            "segment, classify, pose or obb model."
+        )
+    return description
 
-    if is_end2end:
-        LOGGER.info(f"{colorstr('D-Robotics:')} End-to-End (One2One) architecture detected. Post-process will skip NMS.")
-        # Store end2end flag in the model for the exporter to pick up
-        if hasattr(model, "args"):
-            model.args["end2end"] = True
 
-    for m in model.modules():
-        if isinstance(m, Detect) and not isinstance(m, (Segment, Pose, OBB, Segment26, Pose26, OBB26, YOLOESegment26)):
-            m.forward = bpu_detect_forward.__get__(m, Detect)
-            LOGGER.info(f"{colorstr('D-Robotics:')} Patched Detect head for BPU.")
-        elif isinstance(m, v10Detect):
-            m.forward = bpu_v10_detect_forward.__get__(m, v10Detect)
-            LOGGER.info(f"{colorstr('D-Robotics:')} Patched YOLOv10 Detect head for BPU.")
-        elif isinstance(m, (Segment, Segment26, YOLOESegment26)):
-            m.forward = bpu_segment_forward.__get__(m, type(m))
-            LOGGER.info(f"{colorstr('D-Robotics:')} Patched Segment head ({type(m).__name__}) for BPU.")
-        elif isinstance(m, (Pose, Pose26)):
-            m.forward = bpu_pose_forward.__get__(m, type(m))
-            LOGGER.info(f"{colorstr('D-Robotics:')} Patched Pose head ({type(m).__name__}) for BPU.")
-        elif isinstance(m, (OBB, OBB26)):
-            m.forward = bpu_obb_forward.__get__(m, type(m))
-            LOGGER.info(f"{colorstr('D-Robotics:')} Patched OBB head ({type(m).__name__}) for BPU.")
-        elif isinstance(m, Classify):
-            # Convert Linear to Conv2d 1x1 for Classify
-            in_features = m.linear.in_features
-            out_features = m.linear.out_features
-            m.conv_linear = torch.nn.Conv2d(in_features, out_features, 1)
-            m.conv_linear.weight.data = m.linear.weight.data.view(out_features, in_features, 1, 1)
-            m.conv_linear.bias.data = m.linear.bias.data
-            m.forward = bpu_classify_forward.__get__(m, Classify)
-            LOGGER.info(f"{colorstr('D-Robotics:')} Patched Classify head for BPU.")
+def _rdk_metadata(head, task):
+    """Build the `rdk` schema-1 metadata for one patched head (shapes are filled by the exporter's dry run)."""
+    if task == "classify":  # no detect branch, strides or reg_max exist on a Classify head
+        return {
+            "schema_version": 1,
+            "task": task,
+            "head_type": type(head).__name__,
+            "input_format": "nv12",
+            "strides": None,
+            "reg_max": None,
+            "branch": None,
+            "end2end": False,
+            "outputs": [{"name": "logits", "role": "logits", "layout": "NHWC"}],
+        }
+    _rdk_branch(head)  # validates the active branch before any artifact is produced
+    strides = [int(s) for s in head.stride.tolist()]
+    outputs = []
+    for stride in strides:
+        outputs.append({"name": f"cls_{stride}", "role": "cls", "layout": "NHWC", "stride": stride})
+        outputs.append({"name": f"box_{stride}", "role": "box", "layout": "NHWC", "stride": stride})
+        if task == "segment":
+            outputs.append({"name": f"mask_{stride}", "role": "mask", "layout": "NHWC", "stride": stride})
+        elif task == "pose":
+            outputs.append({"name": f"kpt_{stride}", "role": "kpt", "layout": "NHWC", "stride": stride})
+        elif task == "obb":
+            outputs.append({"name": f"angle_{stride}", "role": "angle", "layout": "NHWC", "stride": stride})
+    if task == "segment":
+        outputs.append({"name": "proto", "role": "proto", "layout": "NHWC", "stride": 4})  # P3 upsampled 2x
+    description = {
+        "schema_version": 1,
+        "task": task,
+        "head_type": type(head).__name__,
+        "input_format": "nv12",
+        "strides": strides,
+        "reg_max": int(getattr(head, "reg_max", 0)) or None,
+        "branch": "one2one" if head.end2end else "one2many",
+        "end2end": bool(head.end2end),
+        "outputs": outputs,
+    }
+    if task == "pose":
+        description["kpt_shape"] = [int(k) for k in head.kpt_shape]
+    return description
 
-def _prepare_calibration_data(args, cal_data_dir, imgsz):
-    """Generates calibration data using image dataset referenced in args.data."""
-    from ultralytics.data.utils import check_det_dataset
 
-    if not args.data:
-        raise ValueError("Missing 'data' argument for D-Robotics INT8 calibration. E.g., data=coco8.yaml")
+def _write_calibration_files(dataset, cal_dir, prefix=""):
+    """Write calibration images as the X5 toolchain's expected RGB float32 NCHW files.
 
-    os.makedirs(cal_data_dir, exist_ok=True)
-    try:
-        data = check_det_dataset(args.data)
-        # Strictly use 'train' for calibration, as it provides better diversity
-        train_path = data.get("train", "")
-        if not train_path:
-            raise ValueError(f"No 'train' split found in {args.data}. Calibration requires training data.")
-    except Exception as e:
-        raise ValueError(f"Could not parse data YAML {args.data} for calibration: {e}")
+    The loader applies the deployment geometry (detector-like LetterBox at the export size, classification resize +
+    center crop) and emits uint8 RGB. The 0-255 float32 bytes match the toolchain's raw NV12 calibration pipeline
+    (RGB -> NV12 -> YUV444 -> -128); the compiled model itself applies the configured ``data_scale`` 1/255.
+    """
+    cal_dir.mkdir(parents=True, exist_ok=True)
+    count = 0
+    for batch in dataset:  # one epoch of the calibration loader; no sampling or count cap
+        for image in batch["img"]:
+            image.numpy()[None].astype(np.float32).tofile(cal_dir / f"calibration_{count:05d}.rgbchw")
+            count += 1
+    if not count:
+        raise ValueError(f"{prefix} INT8 calibration produced no images from 'data'.")
+    LOGGER.info(f"{prefix} wrote {count} calibration images (RGB float32, 0-255) to {cal_dir}")
+    return count
 
-    if isinstance(train_path, list):
-        train_path = train_path[0]
 
-    img_dir = Path(train_path)
-    if img_dir.is_file() and img_dir.suffix == ".txt":
-        with open(img_dir, "r") as f:
-            lines = [x.strip() for x in f.read().splitlines() if x.strip()]
-            img_paths = [Path(x) for x in lines]
-    else:
-        img_paths = list(img_dir.rglob("*.*"))
+def _describe_compiled(bin_file, prefix=""):
+    """Describe a compiled .bin through the toolchain's `rdkx5-sim` CLI, returning its schema-1 JSON or None."""
+    if shutil.which("rdkx5-sim") is None:
+        LOGGER.info(f"{prefix} rdkx5-sim not found on PATH; skipping compiled-spec verification.")
+        return None
+    result = subprocess.run(
+        ["rdkx5-sim", str(bin_file), "--describe"],
+        capture_output=True,
+        text=True,
+        timeout=_DESCRIBE_TIMEOUT,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"{prefix} rdkx5-sim --describe failed ({result.returncode}): {result.stderr.strip()}")
+    return {k: v for k, v in json.loads(result.stdout).items() if k in {"inputs", "outputs"}}
 
-    img_paths = [p for p in img_paths if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]]
 
-    if not img_paths:
-        raise ValueError(f"No images found for calibration in {train_path}")
+def _verify_compiled(spec, outputs, prefix=""):
+    """Fail on any compiled-input/output name or layout mismatch with the recorded raw-head contract."""
+    inputs = spec["inputs"]
+    if len(inputs) != 1 or inputs[0].get("pixel_format") != "nv12":
+        raise ValueError(
+            f"{prefix} compiled .bin exposes {len(inputs)} input(s) with formats "
+            f"{[i.get('pixel_format') for i in inputs]}; expected the single compiled NV12 input."
+        )
+    compiled = spec["outputs"]
+    names = [o["name"] for o in outputs]
+    if [o["name"] for o in compiled] != names:
+        raise ValueError(
+            f"{prefix} compiled .bin outputs {[o['name'] for o in compiled]} do not match the exported ONNX "
+            f"outputs {names}; refusing to guess the role binding. Re-export or file an issue with the logs."
+        )
+    for compiled_out, out in zip(compiled, outputs):
+        if list(compiled_out["shape"]) != list(out["shape"]):  # rank may differ only by trailing unit dims
+            flat_c, flat_o = int(np.prod(compiled_out["shape"])), int(np.prod(out["shape"]))
+            if flat_c != flat_o or list(compiled_out["shape"])[: len(out["shape"])] != list(out["shape"]):
+                raise ValueError(
+                    f"{prefix} compiled output '{out['name']}' shape {compiled_out['shape']} does not extend the "
+                    f"exported shape {out['shape']}."
+                )
+            LOGGER.warning(
+                f"{prefix} compiled output '{out['name']}' deploys as rank-{len(compiled_out['shape'])} "
+                f"{compiled_out['shape']} (source graph rank {len(out['shape'])}); recorded in metadata."
+            )
 
-    import random
-    sample_num = min(args.batch if hasattr(args, 'batch') and args.batch > 1 else 20, len(img_paths))
-    # Randomly select calibration images to ensure better representation
-    img_paths = random.sample(img_paths, sample_num)
 
-    width, height = (imgsz, imgsz) if isinstance(imgsz, int) else (imgsz[1], imgsz[0])
+def onnx2rdk(onnx_file, output_dir, dataset, metadata, prefix=""):
+    """Compile a raw-head ONNX model for the D-Robotics RDK X5 BPU with the external hb_mapper toolchain.
 
-    LOGGER.info(f"Preparing {len(img_paths)} random calibration images from train split for BPU...")
-    for idx, img_path in enumerate(img_paths):
-        img = cv2.imread(str(img_path))
-        if img is None:
-            continue
+    Args:
+        onnx_file (str | Path): Raw-head ONNX model exported by `Exporter.export_rdk`.
+        output_dir (str | Path): Final `{model}_rdk_model` directory receiving `{model}.bin` + `metadata.yaml`.
+        dataset (InfiniteDataLoader): INT8 calibration loader from `Exporter.get_int8_calibration_dataloader`.
+        metadata (dict): Ultralytics export metadata; its `rdk` entry describes the raw outputs.
+        prefix (str): Prefix for log messages.
 
-        input_tensor = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        input_tensor = cv2.resize(input_tensor, (width, height))
-        input_tensor = np.transpose(input_tensor, (2, 0, 1))
-        input_tensor = np.expand_dims(input_tensor, axis=0).astype(np.float32)
+    Returns:
+        (str): Path to the final model directory containing the .bin and metadata.yaml.
+    """
+    import onnx
 
-        dst_path = os.path.join(cal_data_dir, f"cal_{idx}.rgbchw")
-        input_tensor.tofile(dst_path)
+    assert LINUX and not ARM64, "RDK export is only supported on x86_64 Linux with the hb_mapper toolchain."
+    prefix = prefix or colorstr("D-Robotics:")
+    onnx_file = Path(onnx_file)
+    output_dir = Path(output_dir)
+    description = metadata["rdk"]
+    graph_names = [o.name for o in onnx.load(str(onnx_file)).graph.output]
+    if graph_names != [o["name"] for o in description["outputs"]]:
+        raise ValueError(
+            f"{prefix} ONNX graph outputs {graph_names} do not match the recorded raw-head outputs "
+            f"{[o['name'] for o in description['outputs']]}."
+        )
+    if shutil.which("hb_mapper") is None:
+        raise RuntimeError(
+            f"{prefix} 'hb_mapper' not found on PATH. Install the D-Robotics OpenExplore X5 toolchain (Python 3.10) "
+            f"and put its bin directory on PATH, e.g. 'PATH=/opt/explore/3.x.x/x86_64/gcc/bin:$PATH'. "
+            f"See {TOOLCHAIN_DOC}. Dependencies are never installed automatically."
+        )
 
-def export_rdk(model, args, onnx_path=None):
-    """Export an Ultralytics YOLO model to an RDK X5 BPU .bin package using hb_mapper."""
-    prefix = colorstr("D-Robotics:")
-    if ARM64:
-        raise RuntimeError(f"{prefix} Export is only supported on x86_64 Linux with hb_mapper toolchain.")
-
-    imgsz = args.imgsz
-    if isinstance(imgsz, int):
-        imgsz = (imgsz, imgsz)
-
-    if onnx_path is None:
-        onnx_path = Path(args.model).with_suffix(".onnx")
-        from . import torch2onnx
-        torch2onnx(model, torch.zeros(1, 3, *imgsz).to(next(model.parameters()).device), str(onnx_path), opset=11)
-
-    onnx_path = Path(onnx_path).resolve()
-    if not onnx_path.exists():
-        raise FileNotFoundError(f"{prefix} Intermediate ONNX file not found at {onnx_path}")
-
-    save_dir = getattr(args, "save_dir", onnx_path.parent) or onnx_path.parent
-    save_dir = Path(save_dir).resolve()
-    ws_dir = save_dir / ".temporary_workspace"
-    cal_data_dir = ws_dir / ".calibration_data"
-    bpu_output_dir = ws_dir / "bpu_model_output"
-
-    # Clean workspace if exists
-    if ws_dir.exists():
-        shutil.rmtree(ws_dir)
-    ws_dir.mkdir(parents=True)
-    bpu_output_dir.mkdir(parents=True)
-
-    # Prepare calibration
-    _prepare_calibration_data(args, str(cal_data_dir), imgsz)
-
-    model_name = onnx_path.stem
-    output_model_prefix = f"{model_name}_bayese_{imgsz[1]}x{imgsz[0]}_nv12"
-    model_dir = onnx_path.with_name(f"{model_name}_rdk_model")
-    bin_path = model_dir / f"{model_name}.bin"
-
-    yaml_content = f'''model_parameters:
-  onnx_model: '{str(onnx_path)}'
+    if output_dir.exists():
+        shutil.rmtree(output_dir)  # only this export's own output directory; never a failed artifact mix
+    stem = onnx_file.stem
+    h, w = metadata["imgsz"]
+    model_prefix = f"{stem}_bayese_{h}x{w}_nv12"
+    with tempfile.TemporaryDirectory(dir=output_dir.parent, prefix=".rdk_work_") as workspace:
+        workspace = Path(workspace)
+        cal_dir = workspace / "calibration_data"
+        bpu_dir = workspace / "bpu_model_output"
+        bpu_dir.mkdir(parents=True)
+        _write_calibration_files(dataset, cal_dir, prefix)
+        config = workspace / "hb_mapper_config.yaml"
+        config.write_text(
+            f"""model_parameters:
+  onnx_model: '{onnx_file.resolve()}'
   march: "bayes-e"
   layer_out_dump: False
-  working_dir: '{str(bpu_output_dir)}'
-  output_model_file_prefix: '{output_model_prefix}'
+  working_dir: '{bpu_dir.resolve()}'
+  output_model_file_prefix: '{model_prefix}'
 input_parameters:
   input_name: ""
   input_type_rt: 'nv12'
@@ -246,7 +378,7 @@ input_parameters:
   norm_type: 'data_scale'
   scale_value: 0.003921568627451
 calibration_parameters:
-  cal_data_dir: '{str(cal_data_dir)}'
+  cal_data_dir: '{cal_dir.resolve()}'
   cal_data_type: 'float32'
   calibration_type: 'default'
   optimization: set_Softmax_input_int8,set_Softmax_output_int8
@@ -255,45 +387,60 @@ compiler_parameters:
   compile_mode: 'latency'
   debug: true
   optimize_level: 'O3'
-'''
+"""
+        )
+        LOGGER.info(f"{prefix} compiling with hb_mapper makertbin (this can take several minutes)...")
+        compile_log = workspace / "hb_mapper_makertbin.log"
+        failure_log = output_dir.parent / f"{stem}_hb_mapper_makertbin_failure.log"
+        try:
+            result = subprocess.run(
+                ["hb_mapper", "makertbin", "--config", str(config), "--model-type", "onnx"],
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                timeout=_COMPILE_TIMEOUT,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            failure_log.write_text("hb_mapper timed out", encoding="utf-8")
+            raise RuntimeError(
+                f"{prefix} hb_mapper timed out after {_COMPILE_TIMEOUT}s; log retained at {failure_log}."
+            )
+        compile_log.write_text(result.stdout + result.stderr, encoding="utf-8")
+        if result.returncode != 0:
+            shutil.copy2(compile_log, failure_log)  # keep the toolchain output: the workspace is temporary
+            tail = "\n".join((result.stdout + result.stderr).splitlines()[-15:])
+            raise RuntimeError(
+                f"{prefix} hb_mapper failed with exit code {result.returncode}:\n{tail}\n"
+                f"Full log retained at {failure_log}."
+            )
 
-    config_path = ws_dir / "hb_mapper_config.yaml"
-    with open(config_path, "w", encoding="utf-8") as f:
-        f.write(yaml_content)
+        compiled_bin = bpu_dir / f"{model_prefix}.bin"
+        if not compiled_bin.is_file():
+            shutil.copy2(compile_log, failure_log)
+            raise FileNotFoundError(
+                f"{prefix} hb_mapper finished but '{compiled_bin.name}' was not produced; log retained at "
+                f"{failure_log}."
+            )
+        output_dir.mkdir(parents=True)
+        shutil.copy2(compiled_bin, output_dir / f"{stem}.bin")
+        quant_info = bpu_dir / f"{model_prefix}_quant_info.json"
+        if quant_info.is_file():
+            shutil.copy2(quant_info, output_dir)
+        shutil.copy2(compile_log, output_dir)
 
-    LOGGER.info(f"{prefix} Starting BPU compilation with hb_mapper...")
-    original_cwd = os.getcwd()
-    try:
-        os.chdir(ws_dir)
-        subprocess.run(["hb_mapper", "makertbin", "--config", "hb_mapper_config.yaml", "--model-type", "onnx"], check=True)
+    spec = _describe_compiled(output_dir / f"{stem}.bin", prefix)
+    if spec is not None:
+        _verify_compiled(spec, description["outputs"], prefix)
+        description["compiled"] = spec
+    YAML.save(output_dir / "metadata.yaml", metadata)
+    LOGGER.info(f"{prefix} export success: {output_dir}")
+    return str(output_dir)
 
-        # Create output directory
-        model_dir.mkdir(parents=True, exist_ok=True)
 
-        # Find and move the output bin file
-        compiled_bin = next(bpu_output_dir.rglob("*.bin"), None)
-        if compiled_bin:
-            shutil.copy(compiled_bin, bin_path)
-
-            # Move metadata.yaml into the model directory
-            metadata_path = onnx_path.parent / "metadata.yaml"
-            if metadata_path.exists():
-                shutil.move(str(metadata_path), str(model_dir / "metadata.yaml"))
-
-            LOGGER.info(f"{prefix} Export success: {model_dir}")
-        else:
-            LOGGER.error(f"{prefix} Compilation finished but .bin file not found.")
-            raise FileNotFoundError(f"{prefix} Compilation finished but .bin file was not produced.")
-    except Exception as e:
-        LOGGER.error(f"{prefix} BPU compilation failed: {e}")
-        raise
-    finally:
-        os.chdir(original_cwd)
-
-    return str(model_dir)
-
-# --- Vectorized Global Cache ---
+# --- Legacy runtime decode (to move into the RDK backend in a follow-up change) ---
 _RDK_GRIDS = {}
+
 
 def get_rdk_grid(h, w, stride):
     """Cached grid generation for vectorized decoding."""
@@ -302,6 +449,7 @@ def get_rdk_grid(h, w, stride):
         grid_y, grid_x = np.indices((h, w), dtype=np.float32)
         _RDK_GRIDS[key] = np.stack([grid_x, grid_y], axis=-1).reshape(-1, 2) + 0.5
     return _RDK_GRIDS[key]
+
 
 def decode_rdk(outputs, imgsz, score_thres=0.25, nc=80):
     """Decodes D-Robotics BPU outputs with vectorized optimization.
@@ -325,7 +473,7 @@ def decode_rdk(outputs, imgsz, score_thres=0.25, nc=80):
     weights_static = np.arange(reg, dtype=np.float32)
 
     for i, stride in enumerate(strides):
-        cls_feat = outputs[i * 2][0]      # (H, W, nc)
+        cls_feat = outputs[i * 2][0]  # (H, W, nc)
         box_feat = outputs[i * 2 + 1][0]  # (H, W, 4 * reg)
         h, w = cls_feat.shape[:2]
 
@@ -337,8 +485,8 @@ def decode_rdk(outputs, imgsz, score_thres=0.25, nc=80):
             continue
 
         # 2. Extract Valid Candidates
-        valid_cls_logits = cls_feat[mask] # (N, nc)
-        valid_box_raw = box_feat[mask]   # (N, 4 * reg)
+        valid_cls_logits = cls_feat[mask]  # (N, nc)
+        valid_box_raw = box_feat[mask]  # (N, 4 * reg)
         grid = get_rdk_grid(h, w, stride)[mask.flatten()]
 
         # 3. Vectorized DFL (Softmax + Weighted Sum)
@@ -346,7 +494,7 @@ def decode_rdk(outputs, imgsz, score_thres=0.25, nc=80):
         max_vals = np.max(box_reshaped, axis=-1, keepdims=True)
         exp_vals = np.exp(box_reshaped - max_vals)
         box_softmax = exp_vals / np.sum(exp_vals, axis=-1, keepdims=True)
-        ltrb = np.sum(box_softmax * weights_static, axis=-1) # (N, 4)
+        ltrb = np.sum(box_softmax * weights_static, axis=-1)  # (N, 4)
 
         # 4. Box Decoding (ltrb to xywh)
         x1y1 = (grid - ltrb[:, :2]) * stride
@@ -367,6 +515,7 @@ def decode_rdk(outputs, imgsz, score_thres=0.25, nc=80):
     final_pred = np.concatenate(all_preds, axis=0)
     return torch.from_numpy(final_pred).permute(1, 0).unsqueeze(0).float()
 
+
 def decode_rdk26(outputs, imgsz, score_thres=0.25, nc=80):
     """Decodes YOLO26 Anchor-Free BPU outputs with vectorized optimization into final (1, N, 6) detection format."""
     strides = [8, 16, 32]
@@ -376,7 +525,7 @@ def decode_rdk26(outputs, imgsz, score_thres=0.25, nc=80):
     logit_thres = -np.log(1.0 / safe_thres - 1.0)
 
     for i, stride in enumerate(strides):
-        cls_feat = outputs[i * 2][0]      # (H, W, nc)
+        cls_feat = outputs[i * 2][0]  # (H, W, nc)
         box_feat = outputs[i * 2 + 1][0]  # (H, W, 4)
         h, w = cls_feat.shape[:2]
 
@@ -401,10 +550,9 @@ def decode_rdk26(outputs, imgsz, score_thres=0.25, nc=80):
         max_scores = np.max(valid_cls_scores, axis=-1)
         class_ids = np.argmax(valid_cls_scores, axis=-1)
 
-        layer_pred = np.stack([
-            x1y1[:, 0], x1y1[:, 1], x2y2[:, 0], x2y2[:, 1],
-            max_scores, class_ids.astype(np.float32)
-        ], axis=-1) # (N, 6)
+        layer_pred = np.stack(
+            [x1y1[:, 0], x1y1[:, 1], x2y2[:, 0], x2y2[:, 1], max_scores, class_ids.astype(np.float32)], axis=-1
+        )  # (N, 6)
         all_preds.append(layer_pred)
 
     if not all_preds:

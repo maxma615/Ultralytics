@@ -224,7 +224,7 @@ def test_export_formats_include_rdk():
     idx = formats["Argument"].index("rdk")
     assert formats["Format"][idx] == "RDK"
     assert formats["Suffix"][idx] == "_rdk_model"
-    assert formats["Arguments"][idx] == ["data"]
+    assert formats["Arguments"][idx] == ["data", "fraction"]
 
 
 def test_check_rdk_requirements_warns_on_unsupported_non_linux_arm64_platform():
