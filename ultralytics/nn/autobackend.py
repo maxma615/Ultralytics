@@ -415,10 +415,10 @@ class AutoBackend(nn.Module):
         from ultralytics.engine.exporter import export_formats
 
         sf = export_formats()["Suffix"]
-        if (
-            not is_url(p) and Path(p).suffix == ".bin" and isinstance(BaseBackend.read_metadata(p).get("rdk"), dict)
-        ):  # a compiled RDK .bin is identified by its schema-1 metadata sidecar, never by the generic suffix
-            return "rdk"
+        if not is_url(p) and Path(p).suffix == ".bin":  # an RDK .bin is identified by its sidecar, never the suffix
+            meta = BaseBackend.read_metadata(p)
+            if isinstance(meta, dict) and isinstance(meta.get("rdk"), dict):
+                return "rdk"
         if not is_url(p) and not isinstance(p, str):
             check_suffix(p, sf)
         name = Path(p).name.lower()

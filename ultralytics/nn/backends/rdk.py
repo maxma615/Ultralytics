@@ -315,6 +315,7 @@ class RDKBackend(BaseBackend):
         self._validate_contract(description)
         self.apply_metadata(metadata)
         self._bin, self._description = w, description
+        self._layout_warned = set()  # one warning per output even when the cached spec repeats the actual one
         self.dynamic = False  # static deployments; AutoBackend serializes larger batches
         _check(
             self.task == description["task"],
@@ -455,10 +456,13 @@ class RDKBackend(BaseBackend):
             # The byte strides are the authoritative layout; the label alone is only trusted
             # when no strides prove otherwise — an NCHW-labeled tensor is never reinterpreted.
             if _strides_prove_c_order(got.get("strides"), shape) and got.get("layout") not in {None, "NHWC"}:
-                LOGGER.warning(
-                    f"D-Robotics RDK: output '{name}' is labeled {got.get('layout')!r} but its byte strides prove the "
-                    f"recorded NHWC C-order layout; using the strides."
-                )
+                if name not in self._layout_warned:  # the actual spec and a cached one both reach this check
+                    self._layout_warned.add(name)
+                    LOGGER.warning(
+                        f"D-Robotics RDK: output '{name}' is labeled {got.get('layout')!r} but its byte strides prove "
+                        f"dense C-order over the recorded NHWC shape — a known toolchain label quirk, not an axis "
+                        f"reordering; using the strides."
+                    )
             else:
                 _check(
                     got.get("layout") is None or got.get("layout") == "NHWC",

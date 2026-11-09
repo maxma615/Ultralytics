@@ -531,6 +531,7 @@ nav:
           - DeepStream on NVIDIA Jetson: guides/deepstream-nvidia-jetson.md
           - Edge TPU on Raspberry Pi: guides/coral-edge-tpu-on-raspberry-pi.md
           - NVIDIA DGX Spark: guides/nvidia-dgx-spark.md
+          - D-Robotics RDK X5: guides/rdk-deployment.md
           - DL Streamer on Intel: guides/dlstreamer-intel.md
   - YOLOv5 (Legacy):
       - yolov5/index.md

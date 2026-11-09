@@ -241,7 +241,7 @@ def export_formats():
             ["batch", "name", "quantize", "opset", "simplify", "data", "fraction"],
             "isolated-rknn",
         ],
-        ["RDK", "rdk", "_rdk_model", True, False, ["data", "fraction"], "isolated-rdk"],
+        ["RDK", "rdk", "_rdk_model", True, False, ["data", "fraction"], "base"],
         ["ExecuTorch", "executorch", "_executorch_model", True, False, ["batch"], "executorch"],
         [
             "Axelera AI",
@@ -396,16 +396,6 @@ EXPORT_ENVS = {
         "indexes": [],
         "env": {},
         "smoke": ["yolo export format=rknn model=yolo26n.pt imgsz=64 quantize=16"],
-    },
-    "isolated-rdk": {
-        # D-Robotics RDK X5 hb_mapper toolchain; a separate Python 3.10 environment per the deployment guide
-        "python": "3.10",
-        "extras": ["export-base"],
-        "torch": None,
-        "requirements": ["rdkx5-yolo-mapper"],
-        "indexes": [("--index-url", "https://mirrors.aliyun.com/pypi/simple/")],
-        "env": {},
-        "smoke": ["yolo export format=rdk model=yolo11n.pt imgsz=64 data=coco8.yaml"],
     },
     "isolated-axelera": {
         "python": "3.13",

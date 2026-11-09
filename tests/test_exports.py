@@ -226,6 +226,25 @@ def test_export_formats_include_rdk():
     assert formats["Arguments"][idx] == ["data", "fraction"]
 
 
+def test_rdk_decode_matches_head():
+    """Test that the pure RDK decode restores the head's own predictions from its raw NHWC outputs."""
+    from ultralytics.nn.backends.rdk import decode_rdk_outputs
+    from ultralytics.utils.export.rdk import apply_rdk_patches
+
+    torch.manual_seed(0)  # fixed random weights: the decode math is under test, not model accuracy
+    model = YOLO("yolo11n.yaml").model.eval()
+    im = torch.rand(1, 3, 64, 64)
+    with torch.no_grad():
+        reference = model(im)[0]  # the head's own (B, 4 + nc, N) predictions; the loss dict is dropped
+        description = apply_rdk_patches(model)  # binds the raw per-scale NHWC forward the export compiles
+        raw = model(im)
+    for output, tensor in zip(description["outputs"], raw):
+        output["shape"] = list(tensor.shape)  # the exporter's dry run records each shape
+    preds = decode_rdk_outputs({o["name"]: t for o, t in zip(description["outputs"], raw)}, description, len(model.names))
+    assert preds.shape == reference.shape
+    assert torch.allclose(preds, reference, atol=1e-4)
+
+
 @pytest.mark.skipif(not TORCH_2_1, reason="OpenVINO requires torch>=2.1")
 @pytest.mark.parametrize("nms", [None, False])
 def test_export_openvino(nms, isolated_model):
