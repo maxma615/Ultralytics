@@ -124,7 +124,7 @@ from ultralytics import YOLO
 metrics = YOLO("yolo11n_rdk_model").val(data="coco8.yaml", imgsz=640)
 ```
 
-INT8 quantization shifts confences and geometry slightly compared to the FP32 PyTorch model — compare against `YOLO("yolo11n.pt").val(...)` under identical data and settings, and expect differences consistent with quantization rather than bit-exact equality. A representative calibration set is the main lever if the gap is too large.
+INT8 quantization shifts confidences and geometry slightly compared to the FP32 PyTorch model — compare against `YOLO("yolo11n.pt").val(...)` under identical data and settings, and expect differences consistent with quantization rather than bit-exact equality. A representative calibration set is the main lever if the gap is too large.
 
 ## Compiler Performance Estimates
 
