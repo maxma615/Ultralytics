@@ -782,6 +782,7 @@ nav:
               - paddle: reference/nn/backends/paddle.md
               - pytorch: reference/nn/backends/pytorch.md
               - qnn: reference/nn/backends/qnn.md
+              - rdk: reference/nn/backends/rdk.md
               - rknn: reference/nn/backends/rknn.md
               - tensorflow: reference/nn/backends/tensorflow.md
               - tensorrt: reference/nn/backends/tensorrt.md
@@ -870,6 +871,7 @@ nav:
               - openvino: reference/utils/export/openvino.md
               - paddle: reference/utils/export/paddle.md
               - qnn: reference/utils/export/qnn.md
+              - rdk: reference/utils/export/rdk.md
               - rknn: reference/utils/export/rknn.md
               - tensorflow: reference/utils/export/tensorflow.md
               - torchscript: reference/utils/export/torchscript.md
