@@ -5,18 +5,21 @@ Raw-head contract (consumed by the RDK backend, ``ultralytics/nn/backends/rdk.py
 (one2one or one2many) branch as one NHWC tensor per scale, named ``<role>_<stride>`` (plus ``proto`` for Segment and
 ``logits`` for Classify), recorded in ``metadata['rdk']['outputs']`` and bound by name at runtime.
 
-Roles and their numerical meaning:
+Roles and their numerical meaning (``anchors`` = grid cell centers from ``make_anchors(..., grid_cell_offset=0.5)``
+= integer grid + 0.5; the recorded ``reg_max`` decides the box path, not the model family):
 
 - ``cls``: raw class logits per anchor; sigmoid gives per-class object scores.
-- ``box``: ``reg_max > 1`` (YOLO11/v8): ``4 * reg_max`` DFL bin logits, host applies softmax over each side's bins,
-  expectation, then ``(grid + 0.5 ± ltrb) * stride``; ``reg_max == 1`` (YOLO26/v10): direct LTRB distances in stride
-  units with the same anchor equation.
-- ``mask``: raw mask coefficients (``nm``) per anchor; no activation, combined with prototypes host-side.
+- ``box``: ``reg_max > 1``: ``4 * reg_max`` DFL bin logits, host applies softmax over each side's bins, expectation,
+  then ``(anchors ± ltrb) * stride``; ``reg_max == 1``: direct LTRB distances in stride units with the same anchor
+  equation.
+- ``mask``: raw mask coefficients (``nm``) per anchor; no activation; the host combines them with the prototypes
+  the way Ultralytics ``process_mask`` does.
 - ``proto``: prototype map shaped ``(1, H/4, W/4, nm)`` (P3 feature upsampled 2x); no activation.
-- ``kpt``: raw keypoints (``nk`` channels). Pose (YOLO11): ``(raw_xy * 2 + grid + 0.5) * stride`` and
-  ``sigmoid(raw_v)``; Pose26: ``(raw_xy + grid + 0.5) * stride`` (no 2x scale) and ``sigmoid(raw_v)``.
+- ``kpt``: raw keypoints (``nk`` channels). Pose (YOLO11): ``(raw_xy * 2 + (anchors - 0.5)) * stride`` — i.e.
+  ``(raw_xy * 2 + integer_grid) * stride`` — and ``sigmoid(raw_v)``; Pose26: ``(raw_xy + anchors) * stride`` (no
+  2x scale) and ``sigmoid(raw_v)``.
 - ``angle``: OBB11: ``(sigmoid(raw) - 0.25) * pi`` in ``[-pi/4, 3pi/4]``; OBB26: raw angle in radians. Boxes decode
-  with ``dist2rbox(ltrb, angle, grid + 0.5)``.
+  with ``dist2rbox(ltrb, angle, anchors)``.
 - ``logits``: classifier logits; softmax is applied exactly once on the host.
 """
 
@@ -246,6 +249,9 @@ def _rdk_metadata(head, task):
         "reg_max": int(getattr(head, "reg_max", 0)) or None,
         "branch": "one2one" if head.end2end else "one2many",
         "end2end": bool(head.end2end),
+        # the exporter sets both on the head before patching; the one2one top-k decode must reuse them, not guess
+        "max_det": int(head.max_det),
+        "agnostic_nms": bool(head.agnostic_nms),
         "outputs": outputs,
     }
     if task == "pose":
@@ -357,37 +363,43 @@ def onnx2rdk(onnx_file, output_dir, dataset, metadata, prefix=""):
     h, w = metadata["imgsz"]
     model_prefix = f"{stem}_bayese_{h}x{w}_nv12"
     with tempfile.TemporaryDirectory(dir=output_dir.parent, prefix=".rdk_work_") as workspace:
-        workspace = Path(workspace)
+        workspace = Path(workspace).resolve()  # absolute: hb_mapper resolves --config against its own cwd
         cal_dir = workspace / "calibration_data"
         bpu_dir = workspace / "bpu_model_output"
         bpu_dir.mkdir(parents=True)
         _write_calibration_files(dataset, cal_dir, prefix)
         config = workspace / "hb_mapper_config.yaml"
-        config.write_text(
-            f"""model_parameters:
-  onnx_model: '{onnx_file.resolve()}'
-  march: "bayes-e"
-  layer_out_dump: False
-  working_dir: '{bpu_dir.resolve()}'
-  output_model_file_prefix: '{model_prefix}'
-input_parameters:
-  input_name: ""
-  input_type_rt: 'nv12'
-  input_type_train: 'rgb'
-  input_layout_train: 'NCHW'
-  norm_type: 'data_scale'
-  scale_value: 0.003921568627451
-calibration_parameters:
-  cal_data_dir: '{cal_dir.resolve()}'
-  cal_data_type: 'float32'
-  calibration_type: 'default'
-  optimization: set_Softmax_input_int8,set_Softmax_output_int8
-compiler_parameters:
-  jobs: 16
-  compile_mode: 'latency'
-  debug: true
-  optimize_level: 'O3'
-"""
+        YAML.save(  # safe YAML quoting for paths with spaces or apostrophes
+            config,
+            {
+                "model_parameters": {
+                    "onnx_model": str(onnx_file.resolve()),
+                    "march": "bayes-e",
+                    "layer_out_dump": False,
+                    "working_dir": str(bpu_dir.resolve()),
+                    "output_model_file_prefix": model_prefix,
+                },
+                "input_parameters": {
+                    "input_name": "",
+                    "input_type_rt": "nv12",
+                    "input_type_train": "rgb",
+                    "input_layout_train": "NCHW",
+                    "norm_type": "data_scale",
+                    "scale_value": 0.003921568627451,
+                },
+                "calibration_parameters": {
+                    "cal_data_dir": str(cal_dir.resolve()),
+                    "cal_data_type": "float32",
+                    "calibration_type": "default",
+                    "optimization": "set_Softmax_input_int8,set_Softmax_output_int8",
+                },
+                "compiler_parameters": {
+                    "jobs": 16,
+                    "compile_mode": "latency",
+                    "debug": True,
+                    "optimize_level": "O3",
+                },
+            },
         )
         LOGGER.info(f"{prefix} compiling with hb_mapper makertbin (this can take several minutes)...")
         compile_log = workspace / "hb_mapper_makertbin.log"
