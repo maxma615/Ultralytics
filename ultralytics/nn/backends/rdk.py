@@ -39,7 +39,7 @@ _RE_EXPORT = "Re-export with YOLO(model).export(format='rdk') so the deployment 
 _DESCRIBE_TIMEOUT = 600  # seconds for one rdkx5-sim --describe call
 _RUN_TIMEOUT = 600  # seconds for one rdkx5-sim run call (the native timeout stays the CLI's own)
 
-_TASKS = ("detect", "segment", "pose", "obb", "classify")  # canonical task order
+_TASKS = ("detect", "segment", "classify", "pose", "obb")  # canonical task order
 _TASK_ROLES = {"detect": (), "segment": ("mask",), "pose": ("kpt",), "obb": ("angle",)}  # beyond cls/box
 _KPT_DECODE = {"Pose": (2.0, 0.5), "Pose26": (1.0, 0.0)}  # xy = (raw * scale + anchors - offset) * stride
 _OBB_HEADS = {"OBB", "OBB26"}  # OBB applies (sigmoid - 0.25) * pi; OBB26 deploys the raw angle
@@ -309,7 +309,10 @@ class RDKBackend(BaseBackend):
             sidecar.is_file(),
             f"'{w}' has no metadata.yaml with an Ultralytics RDK contract; a bare .bin is not routable. {_RE_EXPORT}",
         )
-        metadata = YAML.load(sidecar)
+        try:
+            metadata = YAML.load(sidecar)
+        except ValueError as error:  # a valid-YAML non-mapping sidecar gets the actionable RDK error at load
+            raise ValueError(f"D-Robotics RDK: {error}. {_RE_EXPORT}") from None
         description = metadata.get("rdk")
         _check(isinstance(description, dict), f"'{sidecar}' carries no 'rdk' contract entry. {_RE_EXPORT}")
         self._validate_contract(description)
@@ -333,6 +336,13 @@ class RDKBackend(BaseBackend):
             )
         if "compiled" in description:  # cached export-time specs must still match the actual I/O
             self._validate_runtime_spec({"schema_version": 1, **description["compiled"]}, "cached rdk.compiled spec")
+            cached_in = description["compiled"]["inputs"][0]
+            _check(
+                cached_in.get("name") == self._input_name
+                and [int(d) for d in cached_in.get("shape", [])] == [1, 3, *self._hw],
+                f"cached rdk.compiled input {cached_in.get('name')}/{cached_in.get('shape')} does not match the actual "
+                f"runtime input '{self._input_name}'/{[1, 3, *self._hw]}. {_RE_EXPORT}",
+            )
         if description["task"] != "classify":
             _check(
                 tuple(int(d) for d in self.imgsz) == (int(self._hw[0]), int(self._hw[1])),
@@ -474,7 +484,6 @@ class RDKBackend(BaseBackend):
                 f"output '{name}' deploys as {shape}, the contract records {recorded['shape']}; a same-size "
                 f"reordering is a different layout and is never reinterpreted. {_RE_EXPORT}",
             )
-        self._input_name, self._hw = inputs[0]["name"], (h, w)
 
     def _load_simulator(self):
         """Resolve the x86 simulator CLI and validate the model's actual I/O through it."""
@@ -508,6 +517,9 @@ class RDKBackend(BaseBackend):
             detail = f"{result.stdout[:300]!r} {result.stderr[:300]!r}"
             raise ValueError(f"D-Robotics RDK: rdkx5-sim --describe returned invalid JSON: {detail}") from None
         self._validate_runtime_spec(spec, "rdkx5-sim --describe")
+        inputs = spec["inputs"][0]  # the actual CLI descriptor owns the runtime input identity
+        h, w = (int(d) for d in inputs["shape"][-2:])
+        self._input_name, self._hw = inputs["name"], (h, w)
 
     def _load_board_runtime(self):
         """Lazily construct the preinstalled board SDK session and validate its actual I/O.
