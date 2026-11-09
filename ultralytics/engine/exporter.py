@@ -241,7 +241,7 @@ def export_formats():
             ["batch", "name", "quantize", "opset", "simplify", "data", "fraction"],
             "isolated-rknn",
         ],
-        ["RDK", "rdk", "_rdk_model", False, False, ["data", "fraction"], "isolated-rdk"],
+        ["RDK", "rdk", "_rdk_model", True, False, ["data", "fraction"], "isolated-rdk"],
         ["ExecuTorch", "executorch", "_executorch_model", True, False, ["batch"], "executorch"],
         [
             "Axelera AI",

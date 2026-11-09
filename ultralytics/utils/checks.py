@@ -665,35 +665,6 @@ def check_requirements(requirements=ROOT.parent / "requirements.txt", exclude=()
     return True
 
 
-def check_rdk_requirements():
-    """Check and install D-Robotics export requirements."""
-    if LINUX and not ARM64:  # Export is only supported on x86_64 Linux
-        check_requirements("rdkx5-yolo-mapper", cmds="-i https://mirrors.aliyun.com/pypi/simple/")
-        return
-
-    if LINUX and ARM64:
-        # On ARM64 Linux, we expect this to be inference on a board.
-        if is_rdk():
-            try:
-                import hbm_runtime  # noqa: F401
-            except ImportError:
-                LOGGER.warning(
-                    "hbm_runtime not found. Please ensure your RDK OS is correctly installed and updated. "
-                    "See https://developer.d-robotics.cc/ for details."
-                )
-        else:
-            LOGGER.warning(
-                "You are attempting to run an RDK BPU model on a non-RDK ARM64 device. "
-                "Hardware acceleration via hbm_runtime is only supported on D-Robotics RDK devices (e.g., RDK X5)."
-            )
-        return
-
-    LOGGER.warning(
-        "RDK export is only supported on x86_64 Linux, and RDK runtime inference is only supported on D-Robotics "
-        "ARM64 devices."
-    )
-
-
 def check_executorch_requirements():
     """Check and install ExecuTorch requirements including platform-specific dependencies."""
     # BUG executorch build on arm64 Docker requires packaging>=22.0 https://github.com/pypa/setuptools/issues/4483
@@ -1224,25 +1195,6 @@ def is_rockchip():
             return soc.replace("\x00", "").split("-", 1)[0] in RKNN_CHIPS
         except OSError:
             return False
-    return False
-
-
-def is_rdk() -> bool:
-    """Check if the current environment is running on a Horizon RDK device.
-
-    Returns:
-        (bool): True if running on a Horizon RDK device (X5, X5U, etc.), False otherwise.
-    """
-    if LINUX and ARM64:
-        # Check soc_name for X5U or other RDK series
-        soc_name_path = Path("/sys/class/socinfo/soc_name")
-        if soc_name_path.exists():
-            try:
-                with open(soc_name_path, "r") as f:
-                    if "X5" in f.read().upper():
-                        return True
-            except OSError:
-                pass
     return False
 
 

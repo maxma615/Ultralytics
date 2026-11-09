@@ -9,7 +9,6 @@ from contextlib import redirect_stderr, redirect_stdout
 from itertools import product
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -225,16 +224,6 @@ def test_export_formats_include_rdk():
     assert formats["Format"][idx] == "RDK"
     assert formats["Suffix"][idx] == "_rdk_model"
     assert formats["Arguments"][idx] == ["data", "fraction"]
-
-
-def test_check_rdk_requirements_warns_on_unsupported_non_linux_arm64_platform():
-    """Test that RDK requirement checks warn and exit cleanly on unsupported platforms."""
-    with patch.object(checks, "LINUX", False), patch.object(checks, "ARM64", False), patch.object(
-        checks.LOGGER, "warning"
-    ) as warning:
-        checks.check_rdk_requirements()
-
-    warning.assert_called_once()
 
 
 @pytest.mark.skipif(not TORCH_2_1, reason="OpenVINO requires torch>=2.1")
