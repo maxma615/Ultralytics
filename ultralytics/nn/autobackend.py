@@ -20,6 +20,7 @@ from ultralytics.utils.torch_utils import TORCH_1_10, TORCH_1_13, smart_inferenc
 from .backends import (
     AscendBackend,
     AxeleraBackend,
+    BaseBackend,
     CoreAIBackend,
     CoreMLBackend,
     DeepXBackend,
@@ -414,6 +415,10 @@ class AutoBackend(nn.Module):
         from ultralytics.engine.exporter import export_formats
 
         sf = export_formats()["Suffix"]
+        if (
+            not is_url(p) and Path(p).suffix == ".bin" and isinstance(BaseBackend.read_metadata(p).get("rdk"), dict)
+        ):  # a compiled RDK .bin is identified by its schema-1 metadata sidecar, never by the generic suffix
+            return "rdk"
         if not is_url(p) and not isinstance(p, str):
             check_suffix(p, sf)
         name = Path(p).name.lower()

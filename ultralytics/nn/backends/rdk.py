@@ -59,6 +59,59 @@ def _check(condition, message):
         raise ValueError(f"D-Robotics RDK: {message}")
 
 
+def _shape_deployment_matches(actual, recorded):
+    """Compare an actual deployed shape with the recorded contract shape, strictly.
+
+    Follows the export-time `_verify_compiled` rule: the ordered dimensions must be equal, or
+    the recorded shape must be an ordered prefix of the deployed one with the same element
+    count (i.e. the deployment only appends trailing unit dimensions for rank promotion). A
+    same-element-count permutation is a different layout and never matches.
+
+    Args:
+        actual (list[int]): Deployed tensor shape as reported by the actual runtime.
+        recorded (list[int]): Recorded contract shape from `metadata['rdk']['outputs']`.
+
+    Returns:
+        (bool): Whether the deployed shape is the recorded shape up to trailing unit dims.
+    """
+    recorded = [int(d) for d in recorded]
+    return [int(d) for d in actual] == recorded or (
+        len(actual) > len(recorded)
+        and [int(d) for d in actual[: len(recorded)]] == recorded
+        and int(np.prod(actual)) == int(np.prod(recorded))
+    )
+
+
+def _strides_prove_c_order(strides, shape, itemsize=4):
+    """Return whether byte strides prove a dense C-order layout over the reported shape.
+
+    The runtime's byte strides are the authoritative memory contract: when the last axis steps
+    one element and every outer axis steps exactly `shape[i+1] * strides[i+1]`, the bytes are
+    C-order over the reported shape regardless of the descriptor's layout label (the vendor
+    toolchain labels some permuted outputs `NCHW` while its own strides prove C-order).
+
+    Args:
+        strides (list[int] | None): Per-axis byte strides as reported by the runtime.
+        shape (list[int]): Reported tensor shape the strides step over.
+        itemsize (int): Element size in bytes the strides are measured in.
+
+    Returns:
+        (bool): True when the strides are dense C-order over `shape`.
+    """
+    shape = [int(d) for d in shape]
+    if not strides or len(strides) != len(shape):
+        return False
+    units = [int(s) // itemsize for s in strides]
+    if any(int(s) % itemsize for s in strides) or units[-1] != 1:
+        return False
+    expected = 1
+    for size, stride in zip(reversed(shape), reversed(units)):
+        if stride != expected:
+            return False
+        expected *= size
+    return True
+
+
 def _write_npz(path, arrays):
     """Write named arrays to a standard uncompressed NPZ file.
 
@@ -392,16 +445,30 @@ class RDKBackend(BaseBackend):
             f"binding. {_RE_EXPORT}",
         )
         for got, recorded in zip(spec.get("outputs", []), self._description["outputs"]):
+            name = recorded["name"]
             shape = [int(d) for d in got["shape"]]
             _check(
                 got.get("dtype") == "float32" and got.get("quanti_type") == "NONE",
-                f"output '{recorded['name']}' deploys as {got.get('dtype')}/{got.get('quanti_type')}; only dequantized "
+                f"output '{name}' deploys as {got.get('dtype')}/{got.get('quanti_type')}; only dequantized "
                 f"float32 outputs have a known decode — re-export or use the toolchain runtime.",
             )
+            # The byte strides are the authoritative layout; the label alone is only trusted
+            # when no strides prove otherwise — an NCHW-labeled tensor is never reinterpreted.
+            if _strides_prove_c_order(got.get("strides"), shape) and got.get("layout") not in {None, "NHWC"}:
+                LOGGER.warning(
+                    f"D-Robotics RDK: output '{name}' is labeled {got.get('layout')!r} but its byte strides prove the "
+                    f"recorded NHWC C-order layout; using the strides."
+                )
+            else:
+                _check(
+                    got.get("layout") is None or got.get("layout") == "NHWC",
+                    f"output '{name}' deploys as layout {got.get('layout')!r} with strides {got.get('strides')}; "
+                    f"expected the recorded NHWC layout and no proof of it — never reinterpreted. {_RE_EXPORT}",
+                )
             _check(
-                shape[: len(recorded["shape"])] == list(recorded["shape"])
-                or int(np.prod(shape)) == int(np.prod(recorded["shape"])),
-                f"output '{recorded['name']}' deploys as {shape}, the contract records {recorded['shape']}.",
+                _shape_deployment_matches(shape, recorded["shape"]),
+                f"output '{name}' deploys as {shape}, the contract records {recorded['shape']}; a same-size "
+                f"reordering is a different layout and is never reinterpreted. {_RE_EXPORT}",
             )
         self._input_name, self._hw = inputs[0]["name"], (h, w)
 
@@ -439,7 +506,16 @@ class RDKBackend(BaseBackend):
         self._validate_runtime_spec(spec, "rdkx5-sim --describe")
 
     def _load_board_runtime(self):
-        """Lazily construct the preinstalled board SDK session and validate its actual I/O."""
+        """Lazily construct the preinstalled board SDK session and validate its actual I/O.
+
+        Validates the SDK's own reported values — never assumed ones — against the recorded
+        contract: single NV12 input (dtype, logical shape, no input quantization; the model
+        applies its configured input scaling itself) and float32/non-quantized outputs with
+        matching names and strictly matching shapes. A cached `rdk.compiled` spec, when
+        present, is cross-checked against the same actual SDK values. The SDK exposes names,
+        dtypes, quanti types, logical shapes and strides, but no storage shape or per-tensor
+        layout string; anything it does not expose is not claimed as verified.
+        """
         try:
             import hbm_runtime
         except ImportError as e:
@@ -447,6 +523,19 @@ class RDKBackend(BaseBackend):
                 "D-Robotics RDK: hbm_runtime is required on RDK boards but not importable. Use the board's matching "
                 f"Python environment (it is never auto-installed). See {TOOLCHAIN_DOC}."
             ) from e
+        dt = getattr(hbm_runtime, "hbDNNDataType", None)
+        qt = getattr(hbm_runtime, "hbDNNQuantiType", None)
+        nv12 = f32 = none = None
+        if dt is not None:
+            nv12, f32 = getattr(dt, "NV12", None), getattr(dt, "F32", None)
+        if qt is not None:
+            none = getattr(qt, "NONE", None)
+        _check(
+            nv12 is not None and f32 is not None and none is not None,
+            "the installed hbm_runtime does not expose the hbDNNDataType NV12/F32 or hbDNNQuantiType NONE members "
+            "needed to verify the model I/O; use the RDK's matching SDK. "
+            "Re-export or load this deployment with the rdkx5-sim toolchain instead.",
+        )
         self._runtime = hbm_runtime.HB_HBMRuntime(str(self._bin))
         names = self._runtime.model_names
         _check(len(names) == 1, f"hbm_runtime loaded {len(names)} models {names}; expected exactly one.")
@@ -456,10 +545,25 @@ class RDKBackend(BaseBackend):
             len(input_names) == 1,
             f"board model exposes {len(input_names)} inputs; the deployment expects the single NV12 input.",
         )
-        logical = [int(d) for d in self._runtime.input_shapes[model_name][input_names[0]]]
+        input_name = input_names[0]
+        input_dtype = str(self._runtime.input_dtypes[model_name][input_name])
+        _check(
+            input_dtype == str(nv12),
+            f"board input '{input_name}' dtype {input_dtype} is not the NV12 input this backend feeds; only packed "
+            f"NV12 deployments are supported. {_RE_EXPORT}",
+        )
+        logical = [int(d) for d in self._runtime.input_shapes[model_name][input_name]]
         h, w = logical[-2:]
-        _check(logical == [1, 3, h, w], f"board input shape {logical} is not the recorded (1, 3, H, W) NV12 input.")
-        _check(h % 2 == 0 and w % 2 == 0, f"board input {h}x{w} has odd dimensions; NV12 needs even ones.")
+        _check(
+            logical == [1, 3, h, w] and h % 2 == 0 and w % 2 == 0,
+            f"board input shape {logical} is not an even-dimension (1, 3, H, W) NV12 input.",
+        )
+        input_quant = self._runtime.input_quants[model_name][input_name].quant_type
+        _check(
+            str(input_quant) == str(none),
+            f"board input '{input_name}' carries input quantization {input_quant}; raw packed NV12 bytes would not be "
+            f"interpreted correctly. {_RE_EXPORT}",
+        )
         output_names = list(self._runtime.output_names[model_name])
         expected = [o["name"] for o in self._description["outputs"]]
         _check(
@@ -467,12 +571,42 @@ class RDKBackend(BaseBackend):
             f"board outputs {output_names} do not match the contract {expected}; refusing to guess. {_RE_EXPORT}",
         )
         dtypes = self._runtime.output_dtypes[model_name]
-        dt = getattr(hbm_runtime, "hbDNNDataType", None)
-        _check(
-            dt is None or all(str(dtypes[n]) == str(dt.F32) for n in output_names),
-            "board outputs are not float32; only dequantized float32 outputs have a known decode.",
-        )
-        self._model_name, self._input_name, self._hw = model_name, input_names[0], (h, w)
+        quants = self._runtime.output_quants[model_name]
+        shapes = self._runtime.output_shapes[model_name]
+        strides = getattr(self._runtime, "output_strides", {}).get(model_name, {})
+        for name, recorded in zip(output_names, self._description["outputs"]):
+            _check(
+                str(dtypes[name]) == str(f32) and str(quants[name].quant_type) == str(none),
+                f"board output '{name}' deploys as {dtypes[name]}/{quants[name].quant_type}; only dequantized float32 "
+                f"outputs have a known decode — re-export or use the toolchain runtime.",
+            )
+            _check(
+                _shape_deployment_matches(shapes[name], recorded["shape"]),
+                f"board output '{name}' deploys as {shapes[name]}, the contract records {recorded['shape']}; "
+                f"a same-size reordering is a different layout and is never reinterpreted. {_RE_EXPORT}",
+            )
+            _check(
+                not strides.get(name) or _strides_prove_c_order(strides[name], shapes[name]),
+                f"board output '{name}' byte strides {strides.get(name)} are not dense C-order over "
+                f"{shapes[name]}; the recorded NHWC layout is not proven and is never reinterpreted. {_RE_EXPORT}",
+            )
+        if "compiled" in self._description:  # cached export-time specs must match the actual board I/O
+            cached = self._description["compiled"]
+            cached_in = cached.get("inputs", [{}])[0]
+            _check(
+                cached_in.get("name") == input_name and [int(d) for d in cached_in.get("shape", [])] == [1, 3, h, w],
+                f"cached rdk.compiled input {cached_in.get('name')}/{cached_in.get('shape')} does not match the actual "
+                f"board input '{input_name}'/{logical}. {_RE_EXPORT}",
+            )
+            for got, name in zip(cached.get("outputs", []), output_names):
+                _check(
+                    got.get("name") == name
+                    and got.get("dtype") == "float32"
+                    and _shape_deployment_matches(got.get("shape", []), shapes[name]),
+                    f"cached rdk.compiled output {got.get('name')} does not match the actual board output "
+                    f"'{name}' ({shapes[name]}). {_RE_EXPORT}",
+                )
+        self._model_name, self._input_name, self._hw = model_name, input_name, (h, w)
 
     def forward(self, im: torch.Tensor) -> torch.Tensor | list[torch.Tensor]:
         """Run inference on one RGB image batch through the RDK X5 model.
