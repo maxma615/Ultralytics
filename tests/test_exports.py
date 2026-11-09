@@ -9,6 +9,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from itertools import product
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -215,6 +216,25 @@ def test_torch2onnx_serializes_concurrent_exports(monkeypatch, tmp_path):
 
     assert not errors, f"Concurrent export errors: {errors}"
     assert max_active == 1, f"Expected max 1 concurrent export, got {max_active}"
+
+
+def test_export_formats_include_rdk():
+    """Test that RDK is registered as an export format with the expected suffix and arguments."""
+    formats = export_formats()
+    idx = formats["Argument"].index("rdk")
+    assert formats["Format"][idx] == "RDK"
+    assert formats["Suffix"][idx] == "_rdk_model"
+    assert formats["Arguments"][idx] == ["data"]
+
+
+def test_check_rdk_requirements_warns_on_unsupported_non_linux_arm64_platform():
+    """Test that RDK requirement checks warn and exit cleanly on unsupported platforms."""
+    with patch.object(checks, "LINUX", False), patch.object(checks, "ARM64", False), patch.object(
+        checks.LOGGER, "warning"
+    ) as warning:
+        checks.check_rdk_requirements()
+
+    warning.assert_called_once()
 
 
 @pytest.mark.skipif(not TORCH_2_1, reason="OpenVINO requires torch>=2.1")

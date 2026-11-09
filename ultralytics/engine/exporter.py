@@ -133,6 +133,7 @@ from ultralytics.utils.checks import (
     check_data_portable,
     check_imgsz,
     check_python,
+    check_rdk_requirements,
     check_requirements,
     check_version,
     is_intel,
@@ -241,6 +242,7 @@ def export_formats():
             ["batch", "name", "quantize", "opset", "simplify", "data", "fraction"],
             "isolated-rknn",
         ],
+        ["RDK", "rdk", "_rdk_model", False, False, ["data"], "isolated-rdk"],
         ["ExecuTorch", "executorch", "_executorch_model", True, False, ["batch"], "executorch"],
         [
             "Axelera AI",
@@ -396,6 +398,16 @@ EXPORT_ENVS = {
         "env": {},
         "smoke": ["yolo export format=rknn model=yolo26n.pt imgsz=64 quantize=16"],
     },
+    "isolated-rdk": {
+        # D-Robotics RDK X5 hb_mapper toolchain; a separate Python 3.10 environment per the deployment guide
+        "python": "3.10",
+        "extras": ["export-base"],
+        "torch": None,
+        "requirements": ["rdkx5-yolo-mapper"],
+        "indexes": [("--index-url", "https://mirrors.aliyun.com/pypi/simple/")],
+        "env": {},
+        "smoke": ["yolo export format=rdk model=yolo11n.pt imgsz=64 data=coco8.yaml"],
+    },
     "isolated-axelera": {
         "python": "3.13",
         "extras": ["export-base"],
@@ -480,6 +492,7 @@ INT8_FORMATS = frozenset(
         "mnn",
         "imx",
         "rknn",
+        "rdk",
         "axelera",
         "deepx",
         "hailo",
@@ -489,7 +502,7 @@ INT8_FORMATS = frozenset(
 W8A16_FORMATS = frozenset({"coreml", "litert", "qnn"})  # INT8 weights + 16-bit activations (FP16; INT16 on LiteRT)
 W8A32_FORMATS = frozenset({"litert"})  # INT8 weights + FP32 activations (dynamic/weight-only INT8, no calibration)
 FP32_UNSUPPORTED_FORMATS = frozenset(
-    {"edgetpu", "imx", "rknn", "axelera", "deepx", "qnn", "hailo", "ascend", "xilinx", "nxp"}
+    {"edgetpu", "imx", "rknn", "rdk", "axelera", "deepx", "qnn", "hailo", "ascend", "xilinx", "nxp"}
 )
 # (label, supporting formats) per quantize precision, used to list valid options in errors. 32/None (FP32) is universal except FP32_UNSUPPORTED_FORMATS.
 QUANTIZE_PRECISIONS = (
@@ -710,6 +723,7 @@ class Exporter:
             "hailo",
             "xilinx",
             "nxp",
+            "rdk",
         } and self.args.quantize not in {
             8,
             "w8a16",
@@ -1651,6 +1665,23 @@ class Exporter:
                 if hasattr(self.model, "model") and self.metadata["head"] != "RTDETRDecoder"
                 else None,
             )
+
+    @try_export
+    def export_rdk(self, prefix=colorstr("D-Robotics:")):  # noqa: B008
+        """Export YOLO model to a D-Robotics RDK X5 BPU *.bin model via the hb_mapper toolchain."""
+        from ultralytics.utils.export.rdk import apply_rdk_patches, export_rdk
+
+        check_rdk_requirements()
+        # Apply the BPU-specific raw-head patches to the exporter's model copy
+        apply_rdk_patches(self.model)
+        # Export the intermediate ONNX with the built-in method; opset 11 is well supported by BPU hb_mapper
+        old_opset = self.args.opset
+        self.args.opset = 11
+        onnx_file = self.export_onnx()
+        self.args.opset = old_opset  # restore original opset
+        # Save metadata next to the ONNX; export_rdk() moves it into the final model directory
+        YAML.save(Path(onnx_file).parent / "metadata.yaml", self.metadata)
+        return export_rdk(self.model, self.args, onnx_path=onnx_file)
 
     @try_export
     def export_ascend(self, prefix=colorstr("Ascend:")):  # noqa: B008

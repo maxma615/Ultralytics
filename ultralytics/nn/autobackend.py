@@ -34,6 +34,7 @@ from .backends import (
     PaddleBackend,
     PyTorchBackend,
     QNNBackend,
+    RDKBackend,
     RKNNBackend,
     TensorFlowBackend,
     TensorRTBackend,
@@ -122,6 +123,7 @@ class AutoBackend(nn.Module):
             | NCNN                  | *_ncnn_model/          |
             | IMX                   | *_imx_model/           |
             | RKNN                  | *_rknn_model/          |
+            | RDK                   | *_rdk_model/           |
             | Triton Inference      | http:// or grpc:// URL |
             | ExecuTorch            | *_executorch_model/    |
             | Axelera AI            | *_axelera_model/       |
@@ -174,6 +176,7 @@ class AutoBackend(nn.Module):
         "ncnn": NCNNBackend,
         "imx": ONNXIMXBackend,
         "rknn": RKNNBackend,
+        "rdk": RDKBackend,
         "triton": TritonBackend,
         "executorch": ExecuTorchBackend,
         "axelera": AxeleraBackend,
@@ -272,7 +275,7 @@ class AutoBackend(nn.Module):
         elif channels_last:
             LOGGER.warning(f"'channels_last=True' applies only to native PyTorch models, ignoring format='{format}'.")
 
-        self.nhwc = format in {"coreml", "saved_model", "pb", "edgetpu", "rknn"}
+        self.nhwc = format in {"coreml", "saved_model", "pb", "edgetpu", "rknn", "rdk"}
         self.format = format
 
         # Ensure backend has names (fallback to default if not set by metadata)
