@@ -240,7 +240,9 @@ def test_rdk_decode_matches_head():
         raw = model(im)
     for output, tensor in zip(description["outputs"], raw):
         output["shape"] = list(tensor.shape)  # the exporter's dry run records each shape
-    preds = decode_rdk_outputs({o["name"]: t for o, t in zip(description["outputs"], raw)}, description, len(model.names))
+    preds = decode_rdk_outputs(
+        {o["name"]: t for o, t in zip(description["outputs"], raw)}, description, len(model.names)
+    )
     assert preds.shape == reference.shape
     assert torch.allclose(preds, reference, atol=1e-4)
 
