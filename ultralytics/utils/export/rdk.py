@@ -26,6 +26,7 @@ Roles and their numerical meaning (``anchors`` = grid cell centers from ``make_a
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -289,6 +290,7 @@ def _describe_compiled(bin_file, prefix=""):
         text=True,
         timeout=_DESCRIBE_TIMEOUT,
         check=False,
+        env={k: v for k, v in os.environ.items() if k != "PYTHONPATH"},  # child resolves its own SDK
     )
     if result.returncode != 0:
         raise RuntimeError(f"{prefix} rdkx5-sim --describe failed ({result.returncode}): {result.stderr.strip()}")
@@ -357,8 +359,8 @@ def onnx2rdk(onnx_file, output_dir, dataset, metadata, prefix=""):
             f"See {TOOLCHAIN_DOC}. Dependencies are never installed automatically."
         )
 
-    if output_dir.exists():
-        shutil.rmtree(output_dir)  # only this export's own output directory; never a failed artifact mix
+    # The previous deployment stays untouched until the new one is complete and verified;
+    # a failed export must destroy nothing (staged publish with rollback below).
     stem = onnx_file.stem
     h, w = metadata["imgsz"]
     model_prefix = f"{stem}_bayese_{h}x{w}_nv12"
@@ -412,6 +414,7 @@ def onnx2rdk(onnx_file, output_dir, dataset, metadata, prefix=""):
                 text=True,
                 timeout=_COMPILE_TIMEOUT,
                 check=False,
+                env={k: v for k, v in os.environ.items() if k != "PYTHONPATH"},  # child resolves its own SDK
             )
         except subprocess.TimeoutExpired:
             failure_log.write_text("hb_mapper timed out", encoding="utf-8")
@@ -434,17 +437,32 @@ def onnx2rdk(onnx_file, output_dir, dataset, metadata, prefix=""):
                 f"{prefix} hb_mapper finished but '{compiled_bin.name}' was not produced; log retained at "
                 f"{failure_log}."
             )
-        output_dir.mkdir(parents=True)
-        shutil.copy2(compiled_bin, output_dir / f"{stem}.bin")
+        staging = workspace / "staged_deployment"
+        staging.mkdir()
+        shutil.copy2(compiled_bin, staging / f"{stem}.bin")
         quant_info = bpu_dir / f"{model_prefix}_quant_info.json"
         if quant_info.is_file():
-            shutil.copy2(quant_info, output_dir)
-        shutil.copy2(compile_log, output_dir)
+            shutil.copy2(quant_info, staging)
+        shutil.copy2(compile_log, staging)
 
-    spec = _describe_compiled(output_dir / f"{stem}.bin", prefix)
-    if spec is not None:
-        _verify_compiled(spec, description["outputs"], prefix)
-        description["compiled"] = spec
-    YAML.save(output_dir / "metadata.yaml", metadata)
-    LOGGER.info(f"{prefix} export success: {output_dir}")
-    return str(output_dir)
+        # verify and describe the exact bytes that will be published
+        spec = _describe_compiled(staging / f"{stem}.bin", prefix)
+        if spec is not None:
+            _verify_compiled(spec, description["outputs"], prefix)
+            description["compiled"] = spec
+        YAML.save(staging / "metadata.yaml", metadata)
+
+        # staged publish: move any previous deployment aside, swap in the new one, and
+        # roll back to the old bytes if the swap itself fails
+        backup = None
+        if output_dir.exists():
+            backup = workspace / "previous_deployment"
+            shutil.move(str(output_dir), str(backup))
+        try:
+            os.replace(staging, output_dir)
+        except OSError:
+            if backup is not None:
+                shutil.move(str(backup), str(output_dir))
+            raise
+        LOGGER.info(f"{prefix} export success: {output_dir}")
+        return str(output_dir)
