@@ -74,7 +74,7 @@ Export arguments:
 - `data` and `fraction` select the INT8 calibration images. Calibration quality drives quantization accuracy — use images representative of your deployment domain, not just any small set. RDK export is always INT8 (`quantize=8`); FP32/FP16 are not supported for this format.
 - `imgsz` is the static deployment size (even dimensions; the NV12 input needs even height and width). Detection-family models are typically exported at 640, classifiers at 224.
 - `batch` is fixed to 1 and `dynamic` is not supported — the compiled model is a static single-image deployment, and Ultralytics serializes larger batches automatically.
-- `nms` — `None` (default) exports the one-to-many branch for host-side NMS; `nms=False` selects the YOLO26 NMS-free one-to-one head with its built-in top-k (recorded together with your `max_det`/`agnostic_nms`); `nms=True` is not supported for RDK and falls back to `nms=None` with a warning.
+- `nms` — `None` (default) exports the one-to-many branch for host-side NMS; `nms=False` selects the YOLO26 NMS-free one-to-one head with its built-in top-k using your export-time `max_det`/`agnostic_nms`; `nms=True` is not supported for RDK and falls back to `nms=None` with a warning.
 - Paths containing spaces are supported. Paths containing literal apostrophes are not — relocate the model, data or workspace instead of quoting them.
 
 The export prints the compiled artifacts and leaves them in `{model}_rdk_model/`. Copy that whole directory (the `.bin`, `tail.onnx` and `metadata.yaml` are all required) to the board or another machine.

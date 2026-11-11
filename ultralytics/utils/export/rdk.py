@@ -51,12 +51,16 @@ def split_rdk_graph(onnx_file, head, body_file, tail_file):
         (list[str]): Boundary tensor names, shared by the body outputs and the tail inputs.
 
     Raises:
-        ValueError: If `head` is empty or the graph carries no head `Conv`/`Gemm` boundary.
+        ValueError: If the model type has no supported RDK export head or the graph carries no head
+            `Conv`/`Gemm` boundary.
     """
     import onnx
 
     if not head:
-        raise ValueError("D-Robotics RDK export needs the head's ONNX node scope, e.g. '/model.23/'.")
+        raise ValueError(
+            "D-Robotics RDK export found no supported YOLO head in this model type (RT-DETR and foreign models "
+            "have none); standard YOLO detect, segment, classify, pose and obb graphs are supported."
+        )
     graph = onnx.load(str(onnx_file)).graph
     ends = {x for n in graph.node if n.op_type in {"Reshape", "Concat"} for x in n.input}
     ends -= {x for n in graph.node if n.op_type not in {"Reshape", "Concat"} for x in n.input}

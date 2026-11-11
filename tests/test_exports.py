@@ -250,7 +250,7 @@ def test_rdk_split_matches_onnx(model_name, imgsz, tmp_path):
 
     from ultralytics.utils.export.rdk import split_rdk_graph
 
-    model = YOLO(isolated_model_path(tmp_path, model_name))
+    model = YOLO(isolated_model_path(tmp_path, WEIGHTS_DIR / model_name))
     head = f"/model.{len(model.model.model) - 1}/"  # the head scope the RDK exporter passes to its converter
     f = model.export(format="onnx", imgsz=imgsz, opset=11)
     body_file, tail_file = tmp_path / "body.onnx", tmp_path / "tail.onnx"
