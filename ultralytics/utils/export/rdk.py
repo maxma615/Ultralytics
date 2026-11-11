@@ -1,27 +1,5 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
-"""D-Robotics RDK X5 BPU export logic.
-
-Raw-head contract (consumed by the RDK backend, ``ultralytics/nn/backends/rdk.py``): every head exports its active
-(one2one or one2many) branch as one NHWC tensor per scale, named ``<role>_<stride>`` (plus ``proto`` for Segment and
-``logits`` for Classify), recorded in ``metadata['rdk']['outputs']`` and bound by name at runtime.
-
-Roles and their numerical meaning (``anchors`` = grid cell centers from ``make_anchors(..., grid_cell_offset=0.5)``
-= integer grid + 0.5; the recorded ``reg_max`` decides the box path, not the model family):
-
-- ``cls``: raw class logits per anchor; sigmoid gives per-class object scores.
-- ``box``: ``reg_max > 1``: ``4 * reg_max`` DFL bin logits, host applies softmax over each side's bins, expectation,
-  then ``(anchors ± ltrb) * stride``; ``reg_max == 1``: direct LTRB distances in stride units with the same anchor
-  equation.
-- ``mask``: raw mask coefficients (``nm``) per anchor; no activation; the host combines them with the prototypes
-  the way Ultralytics ``process_mask`` does.
-- ``proto``: prototype map shaped ``(1, H/4, W/4, nm)`` (P3 feature upsampled 2x); no activation.
-- ``kpt``: raw keypoints (``nk`` channels). Pose (YOLO11): ``(raw_xy * 2 + (anchors - 0.5)) * stride`` — i.e.
-  ``(raw_xy * 2 + integer_grid) * stride`` — and ``sigmoid(raw_v)``; Pose26: ``(raw_xy + anchors) * stride`` (no
-  2x scale) and ``sigmoid(raw_v)``.
-- ``angle``: OBB11: ``(sigmoid(raw) - 0.25) * pi`` in ``[-pi/4, 3pi/4]``; OBB26: raw angle in radians. Boxes decode
-  with ``dist2rbox(ltrb, angle, anchors)``.
-- ``logits``: classifier logits; softmax is applied exactly once on the host.
-"""
+"""D-Robotics RDK X5 BPU export: compile a standard ONNX graph's neural body and ship its decode tail."""
 
 from __future__ import annotations
 
@@ -33,7 +11,6 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
-import torch
 
 from ultralytics.utils import ARM64, LINUX, LOGGER, YAML, colorstr
 
@@ -42,222 +19,66 @@ _COMPILE_TIMEOUT = 3600  # seconds; a 640px O3 INT8 compile of a nano model take
 _DESCRIBE_TIMEOUT = 600  # seconds for one rdkx5-sim --describe call
 
 
-def _rdk_branch(head):
-    """Return the fused head's active component dict, failing clearly when the branch is incomplete.
+def _apply_names(model, mapping):
+    """Rename graph tensors in place: every node input/output, initializer and graph I/O entry."""
+    for node in model.graph.node:
+        node.input[:] = [mapping.get(x, x) for x in node.input]
+        node.output[:] = [mapping.get(x, x) for x in node.output]
+    for group in (model.graph.initializer, model.graph.input, model.graph.output, model.graph.value_info):
+        for entry in group:
+            if entry.name in mapping:
+                entry.name = mapping[entry.name]
+    return model
+
+
+def split_rdk_graph(onnx_file, head, body_file, tail_file):
+    """Split a standard ONNX export into its RDK X5 BPU body and its host decode ``tail.onnx``.
+
+    The cut follows ``onnx2rknn``: the head's terminal ``Conv`` outputs (one per feature level) plus
+    any further graph outputs such as segment prototypes end the BPU body, and everything after
+    them — DFL, anchors, sigmoid, keypoint/angle math, one-to-one top-k and the classifier softmax —
+    stays in the tail. The classifier instead ends at its ``Gemm`` logits, keeping the learned
+    fully-connected layer on the BPU. Boundary tensor names containing "/" (all Torch export names
+    do) are renamed to ``outN`` in both graphs: the X5 runtime rejects "/" in output names.
 
     Args:
-        head (Detect): Fused YOLO detect-family head (the exporter already selected and fused one branch).
+        onnx_file (str | Path): Standard ONNX export from `Exporter.export_onnx`.
+        head (str | None): ONNX node-name scope of the model head, e.g. ``"/model.23/"``.
+        body_file (str | Path): Destination for the compiled BPU body graph.
+        tail_file (str | Path): Destination for the host decode tail graph.
 
     Returns:
-        (dict): The head's ``one2one`` or ``one2many`` component dict with every inference component non-None.
+        (list[str]): Boundary tensor names, shared by the body outputs and the tail inputs.
 
     Raises:
-        ValueError: If the selected branch is missing inference components (e.g. fusion removed both heads).
+        ValueError: If `head` is empty or the graph carries no head `Conv`/`Gemm` boundary.
     """
-    branch = head.one2one if head.end2end else head.one2many
-    required = [k for k in branch if k != "kpts_sigma_head"]  # sigma is a training-only output
-    missing = [k for k in required if branch[k] is None]
-    if missing:
+    import onnx
+
+    if not head:
+        raise ValueError("D-Robotics RDK export needs the head's ONNX node scope, e.g. '/model.23/'.")
+    graph = onnx.load(str(onnx_file)).graph
+    ends = {x for n in graph.node if n.op_type in {"Reshape", "Concat"} for x in n.input}
+    ends -= {x for n in graph.node if n.op_type not in {"Reshape", "Concat"} for x in n.input}
+    boundary = [  # head convs feed only these per-level ops, e.g. Concat in WorldDetect
+        n.output[0]
+        for n in graph.node
+        if n.op_type == "Conv" and head in n.name and "/dfl/" not in n.name and n.output[0] in ends
+    ]
+    boundary += [n.output[0] for n in graph.node if n.op_type == "Gemm" and head in n.name]  # classifier logits
+    if not boundary:
         raise ValueError(
-            f"D-Robotics RDK export needs a complete '{'one2one' if head.end2end else 'one2many'}' head, but "
-            f"{type(head).__name__} is missing {missing}. Re-export from the original (unfused) checkpoint."
+            f"D-Robotics RDK export found no head Conv/Gemm boundary under '{head}'; standard YOLO detect, "
+            "segment, classify, pose and obb graphs are supported."
         )
-    return branch
-
-
-def _rdk_detect_forward(self, x):
-    """Detect-family raw BPU forward: cls + box NHWC tensors per scale from the active branch."""
-    branch = _rdk_branch(self)
-    res = []
-    for i in range(self.nl):
-        res.append(branch["cls_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # cls
-        res.append(branch["box_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # box
-    return res
-
-
-def _rdk_segment_forward(self, x):
-    """YOLO11 Segment raw BPU forward: cls + box + mask NHWC per scale, then the P3 prototype map."""
-    branch = _rdk_branch(self)
-    res = []
-    for i in range(self.nl):
-        res.append(branch["cls_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # cls
-        res.append(branch["box_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # box
-        res.append(branch["mask_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # mask coefficients
-    res.append(self.proto(x[0]).permute(0, 2, 3, 1).contiguous())  # protos, H/4 x W/4
-    return res
-
-
-def _rdk_segment26_forward(self, x):
-    """YOLO26 Segment raw BPU forward; Proto26 consumes the whole feature list, unlike Proto."""
-    branch = _rdk_branch(self)
-    res = []
-    for i in range(self.nl):
-        res.append(branch["cls_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # cls
-        res.append(branch["box_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # box
-        res.append(branch["mask_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # mask coefficients
-    res.append(self.proto(x).permute(0, 2, 3, 1).contiguous())  # protos from the fused multi-scale features
-    return res
-
-
-def _rdk_pose_forward(self, x):
-    """YOLO11 Pose raw BPU forward: cls + box + kpt (nk channels) NHWC per scale."""
-    branch = _rdk_branch(self)
-    res = []
-    for i in range(self.nl):
-        res.append(branch["cls_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # cls
-        res.append(branch["box_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # box
-        res.append(branch["pose_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # keypoints
-    return res
-
-
-def _rdk_pose26_forward(self, x):
-    """YOLO26 Pose raw BPU forward; keypoints come from cv4_kpts applied to the cv4 feature maps."""
-    branch = _rdk_branch(self)
-    res = []
-    for i in range(self.nl):
-        feature = branch["pose_head"][i](x[i])  # cv4 feature extractor
-        res.append(branch["cls_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # cls
-        res.append(branch["box_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # box
-        res.append(branch["kpts_head"][i](feature).permute(0, 2, 3, 1).contiguous())  # nk keypoint channels
-    return res
-
-
-def _rdk_obb_forward(self, x):
-    """OBB raw BPU forward: cls + box + angle NHWC per scale; the angle activation is decode-side."""
-    branch = _rdk_branch(self)
-    res = []
-    for i in range(self.nl):
-        res.append(branch["cls_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # cls
-        res.append(branch["box_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # box
-        res.append(branch["angle_head"][i](x[i]).permute(0, 2, 3, 1).contiguous())  # raw angle
-    return res
-
-
-def _rdk_classify_forward(self, x):
-    """Classify raw BPU forward: NHWC logits (1, 1, 1, nc); the host applies softmax exactly once."""
-    if isinstance(x, list):
-        x = torch.cat(x, 1)
-    return self.linear(self.pool(self.conv(x))).permute(0, 2, 3, 1).contiguous()  # linear is a 1x1 Conv2d here
-
-
-def apply_rdk_patches(model):
-    """Bind raw BPU head forwards on the exporter's model copy and return its `rdk` metadata description.
-
-    Args:
-        model (torch.nn.Module): The exporter's deep copy of a fused YOLO model with one selected branch.
-
-    Returns:
-        (dict): `rdk` schema-1 metadata (task, head_type, strides, reg_max, branch, kpt_shape and the ordered
-            `outputs` role list; the exporter fills each entry's `shape` from its dry run).
-
-    Raises:
-        TypeError | ValueError: If the model's head is not one of the standard YOLO11/YOLO26 detect/segment/pose/
-            obb/classify heads (e.g. YOLOE, YOLOWorld or RT-DETR protocols are not validated for RDK export).
-    """
-    from ultralytics.nn.modules import (
-        OBB,
-        Classify,
-        Depth,
-        Detect,
-        LRPCHead,
-        Pose,
-        Pose26,
-        RTDETRDecoder,
-        Segment,
-        Segment26,
-        SemanticSegment,
-        WorldDetect,
-        YOLOEDetect,
-    )
-
-    unsupported = (WorldDetect, LRPCHead, YOLOEDetect, RTDETRDecoder, Depth, SemanticSegment)
-    description = None
-    for module in model.modules():
-        if isinstance(module, unsupported):
-            raise TypeError(
-                f"D-Robotics RDK export supports standard YOLO11/YOLO26 detect, segment, classify, pose and obb "
-                f"models, not the {type(module).__name__} protocol."
-            )
-        forward, task = None, None
-        if isinstance(module, Segment26):
-            forward, task = _rdk_segment26_forward, "segment"
-        elif isinstance(module, Segment):
-            forward, task = _rdk_segment_forward, "segment"
-        elif isinstance(module, Pose26):
-            forward, task = _rdk_pose26_forward, "pose"
-        elif isinstance(module, Pose):
-            forward, task = _rdk_pose_forward, "pose"
-        elif isinstance(module, OBB):  # covers OBB26
-            forward, task = _rdk_obb_forward, "obb"
-        elif isinstance(module, Classify):
-            forward, task = _rdk_classify_forward, "classify"
-        elif isinstance(module, Detect):  # covers v10Detect; runs last so task-specific heads match first
-            forward, task = _rdk_detect_forward, "detect"
-        if forward is not None:
-            if task == "classify":  # BPU-friendly 1x1 conv replacing the flatten + Gemm
-                linear = module.linear
-                module.linear = torch.nn.Conv2d(linear.in_features, linear.out_features, 1, bias=True)
-                module.linear.weight.data = linear.weight.data.view(linear.out_features, linear.in_features, 1, 1)
-                module.linear.bias.data = linear.bias.data
-            module.forward = forward.__get__(module, type(module))
-            description = _rdk_metadata(module, task)
-            LOGGER.info(
-                f"{colorstr('D-Robotics:')} raw {type(module).__name__} head bound "
-                f"({description['branch']}, {len(description['outputs'])} outputs)."
-            )
-    if description is None:
-        raise ValueError(
-            "D-Robotics RDK export found no supported YOLO head; expected a standard YOLO11/YOLO26 detect, "
-            "segment, classify, pose or obb model."
-        )
-    return description
-
-
-def _rdk_metadata(head, task):
-    """Build the `rdk` schema-1 metadata for one patched head (shapes are filled by the exporter's dry run)."""
-    if task == "classify":  # no detect branch, strides or reg_max exist on a Classify head
-        return {
-            "schema_version": 1,
-            "task": task,
-            "head_type": type(head).__name__,
-            "input_format": "nv12",
-            "strides": None,
-            "reg_max": None,
-            "branch": None,
-            "end2end": False,
-            "outputs": [{"name": "logits", "role": "logits", "layout": "NHWC"}],
-        }
-    _rdk_branch(head)  # validates the active branch before any artifact is produced
-    strides = [int(s) for s in head.stride.tolist()]
-    outputs = []
-    for stride in strides:
-        outputs.append({"name": f"cls_{stride}", "role": "cls", "layout": "NHWC", "stride": stride})
-        outputs.append({"name": f"box_{stride}", "role": "box", "layout": "NHWC", "stride": stride})
-        if task == "segment":
-            outputs.append({"name": f"mask_{stride}", "role": "mask", "layout": "NHWC", "stride": stride})
-        elif task == "pose":
-            outputs.append({"name": f"kpt_{stride}", "role": "kpt", "layout": "NHWC", "stride": stride})
-        elif task == "obb":
-            outputs.append({"name": f"angle_{stride}", "role": "angle", "layout": "NHWC", "stride": stride})
-    if task == "segment":
-        outputs.append({"name": "proto", "role": "proto", "layout": "NHWC", "stride": 4})  # P3 upsampled 2x
-    description = {
-        "schema_version": 1,
-        "task": task,
-        "head_type": type(head).__name__,
-        "input_format": "nv12",
-        "strides": strides,
-        "reg_max": int(getattr(head, "reg_max", 0)) or None,
-        "branch": "one2one" if head.end2end else "one2many",
-        "end2end": bool(head.end2end),
-        # the exporter sets both on the head before patching; the one2one top-k decode must reuse them, not guess
-        "max_det": int(head.max_det),
-        "agnostic_nms": bool(head.agnostic_nms),
-        "outputs": outputs,
-    }
-    if task == "pose":
-        description["kpt_shape"] = [int(k) for k in head.kpt_shape]
-    return description
+    boundary += [o.name for o in graph.output if o.name != "output0"]  # e.g. segment prototypes
+    onnx.utils.extract_model(str(onnx_file), str(body_file), [i.name for i in graph.input], boundary)
+    onnx.utils.extract_model(str(onnx_file), str(tail_file), boundary, [o.name for o in graph.output])
+    mapping = {name: f"out{i}" for i, name in enumerate(boundary) if "/" in name}
+    if mapping:
+        for file in (body_file, tail_file):  # one flat name on both sides of the boundary
+            onnx.save(_apply_names(onnx.load(str(file)), mapping), str(file))
+    return [mapping.get(name, name) for name in boundary]
 
 
 def _write_calibration_files(dataset, cal_dir, prefix=""):
@@ -280,9 +101,9 @@ def _write_calibration_files(dataset, cal_dir, prefix=""):
 
 
 def _describe_compiled(bin_file, prefix=""):
-    """Describe a compiled .bin through the toolchain's `rdkx5-sim` CLI, returning its schema-1 JSON or None."""
+    """Describe a compiled .bin through the toolchain's `rdkx5-sim` CLI, returning its inputs/outputs JSON or None."""
     if shutil.which("rdkx5-sim") is None:
-        LOGGER.info(f"{prefix} rdkx5-sim not found on PATH; skipping compiled-spec verification.")
+        LOGGER.info(f"{prefix} rdkx5-sim not found on PATH; skipping compiled-model verification.")
         return None
     result = subprocess.run(
         ["rdkx5-sim", str(bin_file), "--describe"],
@@ -297,65 +118,64 @@ def _describe_compiled(bin_file, prefix=""):
     return {k: v for k, v in json.loads(result.stdout).items() if k in {"inputs", "outputs"}}
 
 
-def _verify_compiled(spec, outputs, prefix=""):
-    """Fail on any compiled-input/output name or layout mismatch with the recorded raw-head contract."""
+def _verify_compiled(spec, expected, prefix=""):
+    """Fail on any compiled-model I/O mismatch with the exported body/tail boundary."""
     inputs = spec["inputs"]
     if len(inputs) != 1 or inputs[0].get("pixel_format") != "nv12":
         raise ValueError(
             f"{prefix} compiled .bin exposes {len(inputs)} input(s) with formats "
             f"{[i.get('pixel_format') for i in inputs]}; expected the single compiled NV12 input."
         )
-    compiled = spec["outputs"]
-    names = [o["name"] for o in outputs]
-    if [o["name"] for o in compiled] != names:
+    names = [o["name"] for o in spec["outputs"]]
+    if names != list(expected):
         raise ValueError(
-            f"{prefix} compiled .bin outputs {[o['name'] for o in compiled]} do not match the exported ONNX "
-            f"outputs {names}; refusing to guess the role binding. Re-export or file an issue with the logs."
+            f"{prefix} compiled .bin outputs {names} do not match the exported boundary {list(expected)}; "
+            "refusing to guess the binding. Re-export or file an issue with the logs."
         )
-    for compiled_out, out in zip(compiled, outputs):
-        if list(compiled_out["shape"]) != list(out["shape"]):  # rank may differ only by trailing unit dims
-            flat_c, flat_o = int(np.prod(compiled_out["shape"])), int(np.prod(out["shape"]))
-            if flat_c != flat_o or list(compiled_out["shape"])[: len(out["shape"])] != list(out["shape"]):
-                raise ValueError(
-                    f"{prefix} compiled output '{out['name']}' shape {compiled_out['shape']} does not extend the "
-                    f"exported shape {out['shape']}."
-                )
-            LOGGER.warning(
-                f"{prefix} compiled output '{out['name']}' deploys as rank-{len(compiled_out['shape'])} "
-                f"{compiled_out['shape']} (source graph rank {len(out['shape'])}); recorded in metadata."
+    for output in spec["outputs"]:
+        if output.get("dtype") != "float32" or output.get("quanti_type") != "NONE":
+            raise ValueError(
+                f"{prefix} output '{output['name']}' deploys as {output.get('dtype')}/{output.get('quanti_type')}; only "
+                "dequantized float32 outputs feed the tail — re-export or use the toolchain runtime."
+            )
+        shape = [int(d) for d in output["shape"]]
+        while len(shape) > len(expected[output["name"]]) and shape[-1] == 1:  # the BPU appends trailing unit dims
+            shape.pop()
+        if shape != expected[output["name"]]:
+            raise ValueError(
+                f"{prefix} output '{output['name']}' deploys as {output['shape']}, the exported boundary records "
+                f"{expected[output['name']]}."
             )
 
 
-def onnx2rdk(onnx_file, output_dir, dataset, metadata, prefix=""):
-    """Compile a raw-head ONNX model for the D-Robotics RDK X5 BPU with the external hb_mapper toolchain.
+def onnx2rdk(onnx_file, output_dir, dataset, metadata, head, prefix=""):
+    """Compile the BPU body of a standard ONNX export for the D-Robotics RDK X5 with `hb_mapper`.
+
+    Splits the graph (`split_rdk_graph`), compiles the body as an INT8 NV12-input `.bin` (Bayes-E
+    architecture, O3) calibrated on `dataset`, verifies the compiled model's actual I/O against the
+    tail graph when `rdkx5-sim` is available, and publishes `{stem}.bin` + `tail.onnx` +
+    `metadata.yaml` in a staged replacement that never destroys the previous deployment on failure.
 
     Args:
-        onnx_file (str | Path): Raw-head ONNX model exported by `Exporter.export_rdk`.
-        output_dir (str | Path): Final `{model}_rdk_model` directory receiving `{model}.bin` + `metadata.yaml`.
+        onnx_file (str | Path): Standard ONNX export from `Exporter.export_onnx` (opset 11).
+        output_dir (str | Path): Final `{model}_rdk_model` directory receiving the deployment.
         dataset (InfiniteDataLoader): INT8 calibration loader from `Exporter.get_int8_calibration_dataloader`.
-        metadata (dict): Ultralytics export metadata; its `rdk` entry describes the raw outputs.
+        metadata (dict): Ultralytics export metadata; a `format: rdk` marker is added for `.bin` routing.
+        head (str | None): ONNX node-name scope of the model head, e.g. ``"/model.23/"``.
         prefix (str): Prefix for log messages.
 
     Returns:
-        (str): Path to the final model directory containing the .bin and metadata.yaml.
+        (str): Path to the final deployment directory.
     """
     import onnx
 
     assert LINUX and not ARM64, "RDK export is only supported on x86_64 Linux with the hb_mapper toolchain."
     prefix = prefix or colorstr("D-Robotics:")
-    onnx_file = Path(onnx_file)
-    output_dir = Path(output_dir)
-    description = metadata["rdk"]
-    graph_names = [o.name for o in onnx.load(str(onnx_file)).graph.output]
-    if graph_names != [o["name"] for o in description["outputs"]]:
-        raise ValueError(
-            f"{prefix} ONNX graph outputs {graph_names} do not match the recorded raw-head outputs "
-            f"{[o['name'] for o in description['outputs']]}."
-        )
+    onnx_file, output_dir = Path(onnx_file), Path(output_dir)
     if shutil.which("hb_mapper") is None:
         raise RuntimeError(
             f"{prefix} 'hb_mapper' not found on PATH. Install the D-Robotics OpenExplore X5 toolchain (Python 3.10) "
-            f"and put its bin directory on PATH, e.g. 'PATH=/opt/explore/3.x.x/x86_64/gcc/bin:$PATH'. "
+            "and put its bin directory on PATH, e.g. 'PATH=/opt/explore/3.x.x/x86_64/gcc/bin:$PATH'. "
             f"See {TOOLCHAIN_DOC}. Dependencies are never installed automatically."
         )
 
@@ -366,6 +186,12 @@ def onnx2rdk(onnx_file, output_dir, dataset, metadata, prefix=""):
     model_prefix = f"{stem}_bayese_{h}x{w}_nv12"
     with tempfile.TemporaryDirectory(dir=output_dir.parent, prefix=".rdk_work_") as workspace:
         workspace = Path(workspace).resolve()  # absolute: hb_mapper resolves --config against its own cwd
+        body_file, tail_file = workspace / "body.onnx", workspace / "tail.onnx"
+        boundary = split_rdk_graph(onnx_file, head, body_file, tail_file)
+        # the tail's own inputs are the runtime contract for the compiled outputs
+        expected = {
+            i.name: [d.dim_value for d in i.type.tensor_type.shape.dim] for i in onnx.load(str(tail_file)).graph.input
+        }
         cal_dir = workspace / "calibration_data"
         bpu_dir = workspace / "bpu_model_output"
         bpu_dir.mkdir(parents=True)
@@ -375,7 +201,7 @@ def onnx2rdk(onnx_file, output_dir, dataset, metadata, prefix=""):
             config,
             {
                 "model_parameters": {
-                    "onnx_model": str(onnx_file.resolve()),
+                    "onnx_model": str(body_file.resolve()),
                     "march": "bayes-e",
                     "layer_out_dump": False,
                     "working_dir": str(bpu_dir.resolve()),
@@ -403,7 +229,7 @@ def onnx2rdk(onnx_file, output_dir, dataset, metadata, prefix=""):
                 },
             },
         )
-        LOGGER.info(f"{prefix} compiling with hb_mapper makertbin (this can take several minutes)...")
+        LOGGER.info(f"{prefix} compiling {len(boundary)}-output body with hb_mapper makertbin (takes minutes)...")
         compile_log = workspace / "hb_mapper_makertbin.log"
         failure_log = output_dir.parent / f"{stem}_hb_mapper_makertbin_failure.log"
         try:
@@ -437,19 +263,20 @@ def onnx2rdk(onnx_file, output_dir, dataset, metadata, prefix=""):
                 f"{prefix} hb_mapper finished but '{compiled_bin.name}' was not produced; log retained at "
                 f"{failure_log}."
             )
+
+        # verify the exact bytes that will be published
+        spec = _describe_compiled(compiled_bin, prefix)
+        if spec is not None:
+            _verify_compiled(spec, expected, prefix)
         staging = workspace / "staged_deployment"
         staging.mkdir()
         shutil.copy2(compiled_bin, staging / f"{stem}.bin")
+        shutil.copy2(tail_file, staging / "tail.onnx")
         quant_info = bpu_dir / f"{model_prefix}_quant_info.json"
         if quant_info.is_file():
             shutil.copy2(quant_info, staging)
         shutil.copy2(compile_log, staging)
-
-        # verify and describe the exact bytes that will be published
-        spec = _describe_compiled(staging / f"{stem}.bin", prefix)
-        if spec is not None:
-            _verify_compiled(spec, description["outputs"], prefix)
-            description["compiled"] = spec
+        metadata["format"] = "rdk"  # routes an ambiguous .bin through the RDK backend
         YAML.save(staging / "metadata.yaml", metadata)
 
         # staged publish: move any previous deployment aside, swap in the new one, and

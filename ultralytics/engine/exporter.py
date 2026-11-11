@@ -1197,14 +1197,7 @@ class Exporter:
             assert TORCH_1_13, f"'nms=True' ONNX export requires torch>=1.13 (found torch=={TORCH_VERSION})"
 
         f = str(self.file.with_suffix(".onnx"))
-        output_names = (
-            # RDK raw heads emit every per-level tensor; name each one from its recorded contract
-            [o["name"] for o in self.metadata["rdk"]["outputs"]]
-            if self.args.format == "rdk"
-            else ["output0", "output1"]
-            if self.model.task == "segment"
-            else ["output0"]
-        )
+        output_names = ["output0", "output1"] if self.model.task == "segment" else ["output0"]
         dynamic = self.args.dynamic
         if dynamic:
             dynamic = {"images": {0: "batch", 2: "height", 3: "width"}}  # shape(1,3,640,640)
@@ -1664,25 +1657,14 @@ class Exporter:
 
     @try_export
     def export_rdk(self, prefix=colorstr("D-Robotics:")):  # noqa: B008
-        """Export YOLO model to a D-Robotics RDK X5 BPU *.bin model via the hb_mapper toolchain."""
-        from ultralytics.utils.export.rdk import apply_rdk_patches, onnx2rdk
+        """Export YOLO model to a D-Robotics RDK X5 BPU *.bin deployment via the hb_mapper toolchain."""
+        from ultralytics.utils.export.rdk import onnx2rdk
 
         # dynamic/batch>1 are rejected by validate_args (only 'data'/'fraction' are valid rdk args); channels is not
         # an export arg, so it is checked here
         assert self.im.shape[1] == 3, "D-Robotics RDK export only supports 3-channel models."
-        # Bind the raw heads on the exporter's model copy and record their schema-1 contract
-        self.metadata["rdk"] = apply_rdk_patches(self.model)
-        y = self.model(self.im)  # dry run the raw heads for the actual output shapes
-        outputs = y if isinstance(y, (list, tuple)) else [y]
-        assert len(outputs) == len(self.metadata["rdk"]["outputs"]), (
-            f"D-Robotics RDK raw head produced {len(outputs)} outputs but the contract lists "
-            f"{len(self.metadata['rdk']['outputs'])}."
-        )
-        for output, shape in zip(self.metadata["rdk"]["outputs"], outputs):
-            output["shape"] = list(shape.shape)
-        # The X5 hb_mapper ONNX parser is validated on opset 11
         opset = self.args.opset
-        self.args.opset = 11
+        self.args.opset = 11  # the X5 hb_mapper ONNX parser is validated on opset 11
         try:
             f_onnx = self.export_onnx()
         finally:
@@ -1692,6 +1674,10 @@ class Exporter:
             output_dir=self.file.parent / f"{self.file.stem}_rdk_model",
             dataset=self.get_int8_calibration_dataloader(prefix),
             metadata=self.metadata,
+            # Foreign models such as YOLO-NAS have no layer list and RT-DETR has no per-level head convs to cut at
+            head=f"/model.{len(self.model.model) - 1}/"
+            if hasattr(self.model, "model") and self.metadata["head"] != "RTDETRDecoder"
+            else None,
             prefix=prefix,
         )
 

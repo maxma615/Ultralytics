@@ -7,7 +7,7 @@ keywords: RDK X5, D-Robotics, RDK, YOLO11, YOLO26, model export, BPU, hb_mapper,
 
 # D-Robotics RDK X5 Deployment for Ultralytics YOLO Models
 
-The [D-Robotics RDK X5](https://developer.d-robotics.cc/rdk_x5) is an embedded developer kit whose BPU (Brain Processing Unit) runs quantized neural networks directly in hardware. Ultralytics exports the standard YOLO11 and YOLO26 model families to the RDK X5 BPU format with `format="rdk"`: the head is exported as raw per-scale tensors, compiled to an INT8 `.bin` by the D-Robotics `hb_mapper` toolchain, and decoded back into standard Ultralytics predictions by the runtime that ships with this repository — on the board through the preinstalled `hbm_runtime` SDK, or on an x86_64 Linux host through the toolchain's `rdkx5-sim` simulator.
+The [D-Robotics RDK X5](https://developer.d-robotics.cc/rdk_x5) is an embedded developer kit whose BPU (Brain Processing Unit) runs quantized neural networks directly in hardware. Ultralytics exports the standard YOLO11 and YOLO26 model families to the RDK X5 BPU format with `format="rdk"`: the model's standard ONNX graph is split into a BPU body (compiled to an INT8 `.bin` by the D-Robotics `hb_mapper` toolchain) and a `tail.onnx` decode graph that runs on the host through ONNX Runtime — on the board with the preinstalled `hbm_runtime` SDK feeding the BPU, or on an x86_64 Linux host through the toolchain's `rdkx5-sim` simulator.
 
 ## Supported Tasks and Heads
 
@@ -21,14 +21,15 @@ RDK export supports the five standard YOLO tasks for both model families. YOLO26
 | [Pose](../tasks/pose.md)         | `yolo11n-pose.pt` … | `yolo26n-pose.pt` … | YOLO26 only              |
 | [OBB](../tasks/obb.md)           | `yolo11n-obb.pt` …  | `yolo26n-obb.pt` …  | YOLO26 only              |
 
-Standard YOLO heads only: YOLOE, YOLOWorld, RT-DETR and other protocols are rejected at export with a clear error. Semantic segmentation and depth are out of scope.
+The validated matrix is the standard YOLO11/YOLO26 heads above; other head protocols (YOLOE, YOLOWorld, RT-DETR, semantic segmentation, depth) are not validated for RDK export. Semantic segmentation and depth are out of scope.
 
 ## How the Pipeline Works
 
-1. **Raw-head ONNX** — the selected head branch (one-to-many by default, one-to-one with `nms=False`) is exported as one NHWC tensor per feature scale, named `cls_<stride>`, `box_<stride>` and the task-specific `mask_`/`kpt_`/`angle_` outputs (plus `proto` for segmentation and the single `logits` for classification). Anchors, DFL, sigmoid, keypoint and angle math all stay on the host so the BPU only computes convolutions.
-2. **INT8 compilation** — `hb_mapper makertbin` quantizes the graph (Bayes-E architecture, `O3`) with calibration images taken from the `data` you pass to `export`.
-3. **Deployment directory** — the export writes `{model}_rdk_model/` containing the compiled `{model}.bin`, its sibling `metadata.yaml` (the schema-1 contract binding output names to roles, plus task, strides, `reg_max`, branch, `max_det`, `agnostic_nms` and `kpt_shape`), the quantization info and the compiler log.
-4. **Runtime decode** — the backend validates the actual model I/O (single NV12 input, float32 outputs, names, shapes, C-order strides) against the recorded contract and then decodes the raw arrays exactly like the PyTorch head: full per-class sigmoid with no confidence prefilter, DFL softmax + expectation, one-to-one top-k with the recorded `max_det`/`agnostic_nms`. NMS, mask assembly and all thresholds stay with the standard Ultralytics predictor.
+1. **Standard ONNX export** — the model exports exactly like `format="onnx"` (opset 11, static single image), with the usual `output0`/`output1` outputs.
+2. **Body/tail split** — the export cuts the graph at the head's terminal convolutions (and the classifier's final fully-connected layer, which stays on the BPU). Everything after that cut — DFL, anchors, sigmoid, keypoint/angle math, one-to-one top-k, the classifier's softmax — becomes the generated `tail.onnx` that ONNX Runtime executes on the host, so no decode is re-implemented outside the exported graph itself.
+3. **INT8 compilation** — `hb_mapper makertbin` quantizes the body (Bayes-E architecture, `O3`, NV12 input) with calibration images taken from the `data` you pass to `export`. When the toolchain's `rdkx5-sim` is on `PATH`, the export also verifies the compiled model's actual I/O against the tail graph before publishing.
+4. **Deployment directory** — the export writes `{model}_rdk_model/` containing the compiled `{model}.bin`, its sibling `tail.onnx`, `metadata.yaml` (the standard Ultralytics export metadata plus a `format: rdk` marker), the quantization info and the compiler log. A failed re-export never destroys the previous deployment.
+5. **Runtime decode** — the backend validates the actual model I/O (single NV12 input, dequantized float32 outputs matching the tail inputs by name and shape), runs the body and feeds its outputs to the tail. NMS, mask assembly and all thresholds stay with the standard Ultralytics predictor.
 
 ## Requirements
 
@@ -76,11 +77,11 @@ Export arguments:
 - `nms` — `None` (default) exports the one-to-many branch for host-side NMS; `nms=False` selects the YOLO26 NMS-free one-to-one head with its built-in top-k (recorded together with your `max_det`/`agnostic_nms`); `nms=True` is not supported for RDK and falls back to `nms=None` with a warning.
 - Paths containing spaces are supported. Paths containing literal apostrophes are not — relocate the model, data or workspace instead of quoting them.
 
-The export prints the compiled artifacts and leaves them in `{model}_rdk_model/`. Copy that whole directory (the `.bin` and its sibling `metadata.yaml` are both required) to the board or another machine.
+The export prints the compiled artifacts and leaves them in `{model}_rdk_model/`. Copy that whole directory (the `.bin`, `tail.onnx` and `metadata.yaml` are all required) to the board or another machine.
 
 ## Run Inference on the RDK X5 Board
 
-The board's system image ships a matching `hbm_runtime` SDK; use it as-is. Do **not** install the public `hbm-runtime` PyPI wheel over the preinstalled board runtime, and do not set any SDK check bypass variables.
+The board's system image ships a matching `hbm_runtime` SDK; use it as-is. Do **not** install the public `hbm-runtime` PyPI wheel over the preinstalled board runtime, and do not set any SDK check bypass variables. The tail graph runs through ONNX Runtime — if the board Python has no `onnxruntime`, install it into a separate virtual environment together with Ultralytics instead of the system packages.
 
 ```python
 from ultralytics import YOLO
@@ -138,8 +139,8 @@ These are compiler-side estimates for locating expensive nodes. Neither `hb_perf
 
 ## FAQ
 
-**Can I load the `.bin` alone?** A bare `.bin` is not routable — the runtime needs the sibling `metadata.yaml` with the schema-1 `rdk` contract, so load the export directory or the `.bin` inside one. Generic third-party `.bin` files are rejected rather than guessed.
+**Can I load the `.bin` alone?** A bare `.bin` is not routable — the runtime needs the sibling `metadata.yaml` (with the `format: rdk` marker) and `tail.onnx`, so load the export directory or the `.bin` inside one. Generic third-party `.bin` files are rejected rather than guessed.
 
-**What about quantized outputs?** Only deployments whose outputs are dequantized to float32 with no output quantization have a known decode; anything else fails at load with a re-export instruction instead of guessing scales.
+**What about deployments from older Ultralytics versions?** Exports from before the body/tail split carry no `tail.onnx` and fail at load with a re-export instruction. Re-export the model with `YOLO(model).export(format="rdk")` — no legacy decode path is retained.
 
-**Why is one output labeled `NCHW` by the toolchain?** Some permuted outputs carry a vendor layout label that disagrees with their own byte strides; the runtime trusts the strides (dense C-order over the recorded NHWC shape) and warns about the label, and any genuinely reordered shape is rejected at load.
+**What about quantized outputs?** Only deployments whose outputs are dequantized to float32 with no output quantization feed the tail; anything else fails at load with a re-export instruction instead of guessing scales.

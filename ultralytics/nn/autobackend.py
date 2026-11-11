@@ -417,7 +417,7 @@ class AutoBackend(nn.Module):
         sf = export_formats()["Suffix"]
         if not is_url(p) and Path(p).suffix == ".bin":  # an RDK .bin is identified by its sidecar, never the suffix
             meta = BaseBackend.read_metadata(p)
-            if isinstance(meta, dict) and isinstance(meta.get("rdk"), dict):
+            if isinstance(meta, dict) and meta.get("format") == "rdk":
                 return "rdk"
         if not is_url(p) and not isinstance(p, str):
             check_suffix(p, sf)

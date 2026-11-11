@@ -20,22 +20,10 @@ keywords: Ultralytics, ultralytics.nn.backends.rdk, API reference, YOLO, Python
 
 <br><br><hr><br>
 
-## ::: ultralytics.nn.backends.rdk._shape_deployment_matches
-
-<br><br><hr><br>
-
-## ::: ultralytics.nn.backends.rdk._strides_prove_c_order
-
-<br><br><hr><br>
-
-## ::: ultralytics.nn.backends.rdk._write_npz
+## ::: ultralytics.nn.backends.rdk._normalized_shape
 
 <br><br><hr><br>
 
 ## ::: ultralytics.nn.backends.rdk._rgb_to_nv12
-
-<br><br><hr><br>
-
-## ::: ultralytics.nn.backends.rdk.decode_rdk_outputs
 
 <br><br>

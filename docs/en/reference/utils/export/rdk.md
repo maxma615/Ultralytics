@@ -12,43 +12,11 @@ keywords: Ultralytics, ultralytics.utils.export.rdk, API reference, YOLO, Python
 
 <br>
 
-## ::: ultralytics.utils.export.rdk._rdk_branch
+## ::: ultralytics.utils.export.rdk._apply_names
 
 <br><br><hr><br>
 
-## ::: ultralytics.utils.export.rdk._rdk_detect_forward
-
-<br><br><hr><br>
-
-## ::: ultralytics.utils.export.rdk._rdk_segment_forward
-
-<br><br><hr><br>
-
-## ::: ultralytics.utils.export.rdk._rdk_segment26_forward
-
-<br><br><hr><br>
-
-## ::: ultralytics.utils.export.rdk._rdk_pose_forward
-
-<br><br><hr><br>
-
-## ::: ultralytics.utils.export.rdk._rdk_pose26_forward
-
-<br><br><hr><br>
-
-## ::: ultralytics.utils.export.rdk._rdk_obb_forward
-
-<br><br><hr><br>
-
-## ::: ultralytics.utils.export.rdk._rdk_classify_forward
-
-<br><br><hr><br>
-
-## ::: ultralytics.utils.export.rdk.apply_rdk_patches
-
-<br><br><hr><br>
-
-## ::: ultralytics.utils.export.rdk._rdk_metadata
+## ::: ultralytics.utils.export.rdk.split_rdk_graph
 
 <br><br><hr><br>
 
