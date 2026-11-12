@@ -7,7 +7,7 @@ keywords: RDK X5, D-Robotics, RDK, YOLO11, YOLO26, model export, BPU, hb_mapper,
 
 # D-Robotics RDK X5 Deployment for Ultralytics YOLO Models
 
-The [D-Robotics RDK X5](https://developer.d-robotics.cc/rdk_x5) is an embedded developer kit whose BPU (Brain Processing Unit) runs quantized neural networks directly in hardware. Ultralytics exports the standard YOLO11 and YOLO26 model families to the RDK X5 BPU format with `format="rdk"`: the model's standard ONNX graph is split into a BPU body (compiled to an INT8 `.bin` by the D-Robotics `hb_mapper` toolchain) and a `tail.onnx` decode graph that runs on the host through ONNX Runtime — on the board with the preinstalled `hbm_runtime` SDK feeding the BPU, or on an x86_64 Linux host through the toolchain's `rdkx5-sim` simulator.
+The [D-Robotics RDK X5](https://developer.d-robotics.cc/rdk_x5) is an embedded developer kit whose BPU (Brain Processing Unit) runs quantized neural networks directly in hardware. Ultralytics exports the standard YOLO11 and YOLO26 model families to the RDK X5 BPU format with `format="rdk"`: the model's standard ONNX graph is split into a BPU body (compiled to an INT8 `.bin` by the D-Robotics `hb_mapper` toolchain) and a `tail.onnx` decode graph that runs on the host through ONNX Runtime — on the board with the preinstalled `hbm_runtime` SDK feeding the BPU, or on an x86_64 Linux host through Mapper's external `rdkx5-sim` CLI.
 
 ## Supported Tasks and Heads
 
@@ -27,7 +27,7 @@ The validated matrix is the standard YOLO11/YOLO26 heads above; other head proto
 
 1. **Standard ONNX export** — the model exports exactly like `format="onnx"` (opset 11, static single image), with the usual `output0`/`output1` outputs.
 2. **Body/tail split** — the export cuts the graph at the head's terminal convolutions (and the classifier's final fully-connected layer, which stays on the BPU). Everything after that cut — DFL, anchors, sigmoid, keypoint/angle math, one-to-one top-k, the classifier's softmax — becomes the generated `tail.onnx` that ONNX Runtime executes on the host, so no decode is re-implemented outside the exported graph itself.
-3. **INT8 compilation** — `hb_mapper makertbin` quantizes the body (Bayes-E architecture, `O3`, NV12 input) with calibration images taken from the `data` you pass to `export`. When the toolchain's `rdkx5-sim` is on `PATH`, the export also verifies the compiled model's actual I/O against the tail graph before publishing.
+3. **INT8 compilation** — `hb_mapper makertbin` quantizes the body (Bayes-E architecture, `O3`, NV12 input) with calibration images taken from the `data` you pass to `export`. When `rdkx5-sim` is on `PATH`, the export also verifies the compiled model's actual I/O against the tail graph before publishing.
 4. **Deployment directory** — the export writes `{model}_rdk_model/` containing the compiled `{model}.bin`, its sibling `tail.onnx`, `metadata.yaml` (the standard Ultralytics export metadata plus a `format: rdk` marker), the quantization info and the compiler log. A failed re-export never destroys the previous deployment.
 5. **Runtime decode** — the backend validates the actual model I/O (single NV12 input, dequantized float32 outputs matching the tail inputs by name and shape), runs the body and feeds its outputs to the tail. NMS, mask assembly and all thresholds stay with the standard Ultralytics predictor.
 
@@ -37,16 +37,17 @@ Export needs **two separate environments on an x86_64 Linux machine**. Ultralyti
 
 1. **Ultralytics environment** — any CPython ≥ 3.8 (the validated setup uses 3.10) with `pip install ultralytics`. A CPU-only PyTorch build is sufficient.
 
-2. **D-Robotics toolchain environment** — CPython 3.10 with the OpenExplore X5 toolchain providing `hb_mapper` (compile) and `rdkx5-sim` (x86 simulation). Put its `bin/` directory on `PATH` of the shell that runs the export:
+2. **D-Robotics toolchain environment** — CPython 3.10 with `hb_mapper` from the OpenExplore X5 toolchain or `rdkx5-yolo-mapper` for compilation. x86 simulation additionally requires a Mapper build that provides `rdkx5-sim`. Put the required CLI tools on `PATH` of the shell that runs the export:
 
 ```bash
 export PATH=/opt/rdk-x5-toolchain/bin:$PATH  # your toolchain install location
-hb_mapper --help && rdkx5-sim --help         # both must resolve before exporting
+hb_mapper --help                          # required for export
+rdkx5-sim --help                          # required for x86 simulation; optional for export I/O verification
 ```
 
 !!! warning "Toolchain package availability"
 
-    The public PyPI package `rdkx5-yolo-mapper` 1.0.0 is **export-only** — it does not contain the `rdkx5-sim` CLI used for host simulation. The validated setup in this guide used a candidate `rdkx5-yolo-mapper` 1.0.1.dev0 build that adds it. Until that candidate is released, obtain the X5 toolchain (or the candidate wheel once published) from [D-Robotics](https://developer.d-robotics.cc/rdk_x5); Ultralytics does not install it and there is no automatic environment or dependency alignment.
+    The public PyPI package `rdkx5-yolo-mapper` 1.0.0 provides `hb_mapper` for export but does not contain `rdkx5-sim`. The validated x86 simulation setup used an unpublished `rdkx5-yolo-mapper` 1.0.1.dev0 candidate that adds this CLI; it is not part of the standard OpenExplore toolchain. Contact [D-Robotics](https://developer.d-robotics.cc/rdk_x5) for a Mapper build with simulation support. Ultralytics does not install or manage the toolchain environment.
 
 ## Export a Model
 

@@ -105,7 +105,7 @@ def _write_calibration_files(dataset, cal_dir, prefix=""):
 
 
 def _describe_compiled(bin_file, prefix=""):
-    """Describe a compiled .bin through the toolchain's `rdkx5-sim` CLI, returning its inputs/outputs JSON or None."""
+    """Describe a compiled .bin through Mapper's `rdkx5-sim` CLI, returning its inputs/outputs JSON or None."""
     if shutil.which("rdkx5-sim") is None:
         LOGGER.info(f"{prefix} rdkx5-sim not found on PATH; skipping compiled-model verification.")
         return None
@@ -139,7 +139,8 @@ def _verify_compiled(spec, expected, prefix=""):
     for output in spec["outputs"]:
         if output.get("dtype") != "float32" or output.get("quanti_type") != "NONE":
             raise ValueError(
-                f"{prefix} output '{output['name']}' deploys as {output.get('dtype')}/{output.get('quanti_type')}; only "
+                f"{prefix} output '{output['name']}' deploys as "
+                f"{output.get('dtype')}/{output.get('quanti_type')}; only "
                 "dequantized float32 outputs feed the tail — re-export or use the toolchain runtime."
             )
         shape = [int(d) for d in output["shape"]]

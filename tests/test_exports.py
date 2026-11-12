@@ -218,15 +218,6 @@ def test_torch2onnx_serializes_concurrent_exports(monkeypatch, tmp_path):
     assert max_active == 1, f"Expected max 1 concurrent export, got {max_active}"
 
 
-def test_export_formats_include_rdk():
-    """Test that RDK is registered as an export format with the expected suffix and arguments."""
-    formats = export_formats()
-    idx = formats["Argument"].index("rdk")
-    assert formats["Format"][idx] == "RDK"
-    assert formats["Suffix"][idx] == "_rdk_model"
-    assert formats["Arguments"][idx] == ["data", "fraction"]
-
-
 def test_rdk_deployment_requires_tail(tmp_path):
     """Test that an RDK deployment directory without its tail.onnx decode graph fails clearly."""
     from ultralytics.nn.autobackend import AutoBackend

@@ -5,7 +5,7 @@ Loads a `{stem}_rdk_model/` deployment (compiled `.bin` + `metadata.yaml` + the 
 graph), runs the compiled body and decodes its outputs through the tail with ONNX Runtime, yielding
 the standard predictions of the exported graph:
 
-- On Linux x86_64 the body runs through the external `rdkx5-sim` CLI of the OpenExplore toolchain
+- On Linux x86_64 the body runs through the external `rdkx5-sim` CLI from `rdkx5-yolo-mapper`
   (one isolated subprocess per call; never installed automatically).
 - On RDK X5 (Linux aarch64) the preinstalled board `hbm_runtime.HB_HBMRuntime` SDK is used.
 """
@@ -86,10 +86,11 @@ class RDKBackend(BaseBackend):
                 graph's inputs are the runtime contract for the compiled outputs.
 
         Raises:
-            (ValueError | FileNotFoundError | RuntimeError): If the deployment is ambiguous, not an
-                RDK export, or its actual runtime I/O disagrees with the tail graph.
+            ValueError: If the deployment is ambiguous, not an RDK export, or its runtime I/O disagrees with the tail.
+            FileNotFoundError: If the compiled model file does not exist.
+            RuntimeError: If the platform or runtime is unavailable, or simulator initialization fails.
         """
-        w = Path(weight)
+        w = Path(weight).resolve()
         if w.is_dir():
             bins = sorted(w.glob("*.bin"))  # top level only; never a recursive first-match
             _check(
@@ -156,8 +157,9 @@ class RDKBackend(BaseBackend):
         sim = shutil.which("rdkx5-sim")
         if sim is None:
             raise RuntimeError(
-                "D-Robotics RDK: 'rdkx5-sim' not found on PATH. Install the D-Robotics OpenExplore X5 toolchain "
-                f"(Python 3.10) and put its bin directory on PATH, or run on an RDK X5 board. See {TOOLCHAIN_DOC}. "
+                "D-Robotics RDK: 'rdkx5-sim' not found on PATH. Use an rdkx5-yolo-mapper build with simulation "
+                "support (Python 3.10) and put its bin directory on PATH, or run on an RDK X5 board. "
+                f"See {TOOLCHAIN_DOC}. "
                 "Dependencies are never installed automatically."
             )
         self._sim = sim
